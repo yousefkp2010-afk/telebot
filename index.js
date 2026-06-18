@@ -13,41 +13,52 @@ const bot = new Telegraf(process.env.BOT_TOKEN);
 bot.on('text', async (ctx) => {
   const text = ctx.message.text.trim();
 
-  // تجاهل أي رسالة لا تبدأ بـ "/ai"
   if (!text.startsWith('/ai')) return;
 
-  // استخراج السؤال بعد "/ai" مع تجاهل الفراغات الزائدة
   const question = text.slice(3).trim();
   if (!question) {
-    return ctx.reply('اكتب سؤالك بعد /ai مثال: /ai ما هو الذكاء الاصطناعي؟');
+    return ctx.reply(
+      '📝 *طريقة الاستخدام*\n\nاكتب سؤالك بعد /ai\nمثال: `/ai ما هو الذكاء الاصطناعي؟`',
+      { parse_mode: 'Markdown' }
+    );
   }
 
   await ctx.sendChatAction('typing');
 
   try {
     const completion = await groq.chat.completions.create({
-      model: 'llama-3.1-8b-instant',
+      model: 'llama-3.3-70b-versatile',
       messages: [
-        { role: 'system', content: 'أنت مساعد ذكي ومختصر.' },
+        {
+          role: 'system',
+          content: `أنت مساعد ودود ومفيد. أجب بطريقة منظمة وجميلة. استخدم التنسيق التالي:
+- ضع العناوين الرئيسية بين نجمتين ** مثل: **عنوان**
+- أضف إيموجيز مناسبة في بداية العناوين أو الفقرات
+- اجعل الفقرات واضحة ومتباعدة
+- عند كتابة أكواد برمجية، ضعها في كتلة منفصلة باستخدام \`\`\`
+- استخدم تنسيق Markdown العادي (وليس MarkdownV2)
+- لا تستخدم أحرفاً خاصة مثل _ أو [ ] إلا للغرض التنسيقي`
+        },
         { role: 'user', content: question },
       ],
       stream: false,
     });
 
-    const reply = completion.choices[0]?.message?.content || 'لم أستطع الإجابة.';
-    ctx.reply(reply);
+    const reply = completion.choices[0]?.message?.content || '❌ لم أستطع الإجابة.';
+
+    // إرسال الرد بتنسيق Markdown
+    await ctx.reply(reply, { parse_mode: 'Markdown' });
   } catch (error) {
     console.error('خطأ Groq:', error.message);
-    ctx.reply('عذراً، حدث خطأ داخلي. حاول مرة أخرى لاحقاً.');
+    // في حال فشل التنسيق، نرسل بدون تنسيق
+    ctx.reply('⚠️ عذراً، حدث خطأ داخلي. حاول مرة أخرى لاحقاً.');
   }
 });
 
 // ── خادم Express لاستقبال pings (يمنع النوم) ──
 const app = express();
 const PORT = process.env.PORT || 3000;
-
 app.get('/', (req, res) => res.send('Bot is alive'));
-
 app.listen(PORT, () => {
   console.log(`Express يستمع على المنفذ ${PORT}`);
 });
@@ -65,7 +76,7 @@ if (GUARD_URL) {
       .catch((err) => console.error('Guard ping failed:', err.message));
   };
   setInterval(ping, 30000);
-  ping(); // ابدأ فوراً
+  ping();
 }
 
 // ── إيقاف آمن عند إغلاق الخدمة ──
