@@ -1,84 +1,293 @@
 require('dotenv').config();
 const { Telegraf } = require('telegraf');
 const Groq = require('groq-sdk');
+const OpenAI = require('openai');
 const express = require('express');
 
-// ── عميل Groq ──
+// ── إعدادات ────────────────────────────────────
+const bot = new Telegraf(process.env.BOT_TOKEN);
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID; // رقم شات المالك للإحصائيات
+
+// ── عملاء API ───────────────────────────────────
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-// ── بوت تيليغرام ──
-const bot = new Telegraf(process.env.BOT_TOKEN);
+let gemini = null;
+if (process.env.GEMINI_API_KEY) {
+  gemini = new OpenAI({
+    apiKey: process.env.GEMINI_API_KEY,
+    baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
+  });
+}
 
-// الرد فقط على الرسائل التي تبدأ بـ "/ai"
-bot.on('text', async (ctx) => {
-  const text = ctx.message.text.trim();
+// ── ذاكرة المحادثة (سياق بسيط) ────────────────
+const sessions = new Map(); // مفتاح: userId, قيمة: { messages: [], lastActive: timestamp }
+const SESSION_TTL = 10 * 60 * 1000; // 10 دقائق
+const MAX_HISTORY = 6; // عدد الرسائل المحفوظة (زوجي: 3 تبادلات)
 
-  if (!text.startsWith('/ai')) return;
-
-  const question = text.slice(3).trim();
-  if (!question) {
-    return ctx.reply(
-      '📝 *طريقة الاستخدام*\n\nاكتب سؤالك بعد /ai\nمثال: `/ai ما هو الذكاء الاصطناعي؟`',
-      { parse_mode: 'Markdown' }
-    );
+function getSession(userId) {
+  const now = Date.now();
+  let session = sessions.get(userId);
+  if (!session || now - session.lastActive > SESSION_TTL) {
+    session = { messages: [], lastActive: now };
+    sessions.set(userId, session);
+  } else {
+    session.lastActive = now;
   }
+  return session;
+}
 
-  await ctx.sendChatAction('typing');
+function addMessageToSession(userId, role, content) {
+  const session = getSession(userId);
+  session.messages.push({ role, content });
+  if (session.messages.length > MAX_HISTORY) {
+    session.messages.shift();
+  }
+}
+
+// ── إحصائيات بسيطة ────────────────────────────
+const stats = {
+  groq: { success: 0, fail: 0, totalTime: 0 },
+  gemini: { success: 0, fail: 0, totalTime: 0 },
+  lastReset: Date.now(),
+};
+
+function recordStat(model, success, duration) {
+  const s = stats[model];
+  if (success) {
+    s.success++;
+    s.totalTime += duration;
+  } else {
+    s.fail++;
+  }
+}
+
+// ── دالة الرد المتدفق (Streaming) ─────────────
+async function sendStreamedReply(ctx, model, client, modelName, messages) {
+  const loadingMsg = await ctx.reply('⏳ جارٍ التفكير...');
+  let fullText = '';
 
   try {
-    const completion = await groq.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
-      messages: [
-        {
-          role: 'system',
-          content: `أنت مساعد ودود ومفيد. أجب بطريقة منظمة وجميلة. استخدم التنسيق التالي:
-- ضع العناوين الرئيسية بين نجمتين ** مثل: **عنوان**
-- أضف إيموجيز مناسبة في بداية العناوين أو الفقرات
-- اجعل الفقرات واضحة ومتباعدة
-- عند كتابة أكواد برمجية، ضعها في كتلة منفصلة باستخدام \`\`\`
-- استخدم تنسيق Markdown العادي (وليس MarkdownV2)
-- لا تستخدم أحرفاً خاصة مثل _ أو [ ] إلا للغرض التنسيقي`
-        },
-        { role: 'user', content: question },
-      ],
-      stream: false,
+    const stream = await client.chat.completions.create({
+      model: modelName,
+      messages,
+      stream: true,
     });
 
-    const reply = completion.choices[0]?.message?.content || '❌ لم أستطع الإجابة.';
+    let updateCounter = 0;
+    for await (const chunk of stream) {
+      const content = chunk.choices[0]?.delta?.content || '';
+      fullText += content;
+      updateCounter++;
+      // تحديث الرسالة كل 5 كلمات لتجنب الـ Rate Limit
+      if (updateCounter % 5 === 0 && fullText.length > 0) {
+        await ctx.telegram.editMessageText(
+          ctx.chat.id,
+          loadingMsg.message_id,
+          undefined,
+          fullText,
+          { parse_mode: 'Markdown' }
+        ).catch(() => {});
+      }
+    }
 
-    // إرسال الرد بتنسيق Markdown
-    await ctx.reply(reply, { parse_mode: 'Markdown' });
-  } catch (error) {
-    console.error('خطأ Groq:', error.message);
-    // في حال فشل التنسيق، نرسل بدون تنسيق
-    ctx.reply('⚠️ عذراً، حدث خطأ داخلي. حاول مرة أخرى لاحقاً.');
+    // التحديث النهائي
+    if (fullText.length > 0) {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        loadingMsg.message_id,
+        undefined,
+        fullText,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    } else {
+      // لو ما وصل شيء
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        loadingMsg.message_id,
+        undefined,
+        '❌ لم أحصل على رد.',
+      ).catch(() => {});
+    }
+
+    return fullText; // ناجح
+  } catch (e) {
+    // حذف رسالة التحميل وإظهار الخطأ
+    await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
+    throw e; // نعيد الخطأ ليعالجه الـ fallback
+  }
+}
+
+// ── معالج الأوامر /start ──────────────────────
+bot.start((ctx) => {
+  const welcome = `🌟 **مرحباً بك في البوت الذكي!**\n\n` +
+    `🔹 **/gemini سؤالك** ← ذكاء عميق (Google Gemini)\n` +
+    `🔹 **/groq سؤالك** ← سرعة فائقة (Groq)\n\n` +
+    `📌 *مثال:* /gemini اشرح الثقوب السوداء\n` +
+    `📌 *مثال:* /groq اكتب دالة بايثون لترتيب قائمة\n\n` +
+    `⚡ جرب كلا النموذجين وقارن!\n` +
+    `ℹ️ استخدم /help لمعرفة كافة الأوامر.`;
+  ctx.reply(welcome, { parse_mode: 'Markdown' });
+});
+
+// ── أمر /help ──────────────────────────────────
+bot.help((ctx) => {
+  const help = `📘 **دليل الاستخدام**\n\n` +
+    `• **/gemini [نص]** – اسأل نموذج Google Gemini (عميق)\n` +
+    `• **/groq [نص]** – اسأل نموذج Groq (سريع)\n` +
+    `• **/start** – رسالة الترحيب\n` +
+    `• **/help** – هذا الدليل\n` +
+    `• **/stats** – إحصائيات الاستخدام (للمالك فقط)\n\n` +
+    `🔄 **ميزة السياق:** يستطيع البوت تذكر آخر 3 تبادلات لمدة 10 دقائق.\n` +
+    `⚠️ **احتياطي:** إذا فشل نموذج، ينتقل تلقائياً إلى الآخر.`;
+  ctx.reply(help, { parse_mode: 'Markdown' });
+});
+
+// ── أمر /stats (للمالك فقط) ────────────────────
+bot.command('stats', (ctx) => {
+  const userId = String(ctx.from.id);
+  if (ADMIN_CHAT_ID && userId !== ADMIN_CHAT_ID) {
+    return ctx.reply('⛔ هذا الأمر مخصص للمالك فقط.');
+  }
+
+  const now = Date.now();
+  const uptimeMs = now - stats.lastReset;
+  const uptimeMins = Math.floor(uptimeMs / 60000);
+
+  const groqAvg = stats.groq.success > 0 ? (stats.groq.totalTime / stats.groq.success).toFixed(0) : 0;
+  const geminiAvg = stats.gemini.success > 0 ? (stats.gemini.totalTime / stats.gemini.success).toFixed(0) : 0;
+
+  const report = `📊 **إحصائيات البوت** (آخر ${uptimeMins} دقيقة)\n\n` +
+    `⚡ **Groq:** ${stats.groq.success} نجاح | ${stats.groq.fail} فشل | متوسط ${groqAvg}ms\n` +
+    `🧠 **Gemini:** ${stats.gemini.success} نجاح | ${stats.gemini.fail} فشل | متوسط ${geminiAvg}ms\n` +
+    `🔄 **الذاكرة:** ${sessions.size} مستخدم نشط`;
+  ctx.reply(report, { parse_mode: 'Markdown' });
+});
+
+// ── استخراج السؤال بعد الأمر ──────────────────
+function extractQuestion(text, command) {
+  // إزالة الأمر والمسافة التي تليه
+  if (text.startsWith(command + ' ')) {
+    return text.slice(command.length + 1).trim();
+  }
+  if (text.startsWith(command)) {
+    return text.slice(command.length).trim();
+  }
+  return '';
+}
+
+// ── قلب البوت: معالج الرسائل ──────────────────
+bot.on('text', async (ctx) => {
+  const text = ctx.message.text.trim();
+  const userId = ctx.from.id;
+
+  // تجاهل أي رسالة لا تبدأ بـ /gemini أو /groq
+  if (!text.startsWith('/gemini') && !text.startsWith('/groq')) return;
+
+  // تحديد النموذج المطلوب
+  const isGemini = text.startsWith('/gemini');
+  const command = isGemini ? '/gemini' : '/groq';
+  const question = extractQuestion(text, command);
+
+  if (!question) {
+    return ctx.reply(`❓ اكتب سؤالك بعد ${command}\nمثال: ${command} ما هو الذكاء الاصطناعي؟`);
+  }
+
+  // تحضير السياق
+  const session = getSession(userId);
+  const systemMessage = { role: 'system', content: 'أنت مساعد خبير، أجب بإجابات واضحة ومنسقة باستخدام Markdown مع إيموجيز خفيفة.' };
+  const messages = [systemMessage, ...session.messages, { role: 'user', content: question }];
+
+  // دالة تنفيذ الطلب مع قياس الزمن
+  const executeRequest = async (modelType, client, modelName) => {
+    const start = Date.now();
+    try {
+      await ctx.sendChatAction('typing');
+      const reply = await sendStreamedReply(ctx, modelType, client, modelName, messages);
+      // حفظ السؤال والرد في السياق
+      addMessageToSession(userId, 'user', question);
+      addMessageToSession(userId, 'assistant', reply);
+      const duration = Date.now() - start;
+      recordStat(modelType, true, duration);
+      return true;
+    } catch (error) {
+      const duration = Date.now() - start;
+      recordStat(modelType, false, duration);
+      console.error(`خطأ ${modelType}:`, error.message);
+      return false;
+    }
+  };
+
+  // المحاولة الأولى: النموذج الذي اختاره المستخدم
+  if (isGemini) {
+    if (!gemini) {
+      // لا يوجد مفتاح Gemini، نجرب Groq مباشرة مع إعلام المستخدم
+      ctx.reply('⚠️ نموذج Gemini غير مفعل. جاري استخدام Groq بدلاً منه...');
+      const success = await executeRequest('groq', groq, 'llama-3.3-70b-versatile');
+      if (!success) ctx.reply('❌ فشل كلا النموذجين. حاول لاحقاً.');
+      return;
+    }
+
+    const success = await executeRequest('gemini', gemini, 'gemini-1.5-pro');
+    if (!success) {
+      // Fallback إلى Groq
+      ctx.reply('⚠️ تعذر الاتصال بـ Gemini. جاري تحويل طلبك إلى Groq...');
+      const groqSuccess = await executeRequest('groq', groq, 'llama-3.3-70b-versatile');
+      if (!groqSuccess) {
+        ctx.reply('❌ فشل كلا النموذجين. حاول لاحقاً.');
+      }
+    }
+  } else {
+    // Groq مباشرة
+    const success = await executeRequest('groq', groq, 'llama-3.3-70b-versatile');
+    if (!success) {
+      // إذا فشل Groq، ننتقل إلى Gemini إن وُجد
+      if (gemini) {
+        ctx.reply('⚠️ تعذر الاتصال بـ Groq. جاري تحويل طلبك إلى Gemini...');
+        const gemSuccess = await executeRequest('gemini', gemini, 'gemini-1.5-pro');
+        if (!gemSuccess) ctx.reply('❌ فشل كلا النموذجين. حاول لاحقاً.');
+      } else {
+        ctx.reply('❌ فشل نموذج Groq ولا يوجد نموذج بديل.');
+      }
+    }
   }
 });
 
-// ── خادم Express لاستقبال pings (يمنع النوم) ──
+// ── خادم Express (نقطة صحية + اختبار Gemini) ──
 const app = express();
 const PORT = process.env.PORT || 3000;
-app.get('/', (req, res) => res.send('Bot is alive'));
-app.listen(PORT, () => {
-  console.log(`Express يستمع على المنفذ ${PORT}`);
+
+app.get('/', (_, res) => res.send('Bot is alive'));
+
+app.get('/test-gemini', async (_, res) => {
+  if (!gemini) return res.send('Gemini غير مهيأ: لا يوجد GEMINI_API_KEY');
+  try {
+    const response = await gemini.chat.completions.create({
+      model: 'gemini-1.5-pro',
+      messages: [{ role: 'user', content: 'قل مرحباً بالعربية' }],
+    });
+    res.send(`✅ نجح Gemini: ${response.choices[0].message.content}`);
+  } catch (e) {
+    res.send(`❌ فشل Gemini: ${e.message}`);
+  }
 });
 
-// ── تشغيل البوت (Long Polling) ──
-bot.launch();
-console.log('البوت يعمل بـ Long Polling...');
+app.listen(PORT, () => console.log(`Express يعمل على ${PORT}`));
 
-// ── إرسال ping إلى الحارس كل 30 ثانية (إن وُجد) ──
+// ── تشغيل البوت ────────────────────────────────
+bot.launch();
+console.log('🤖 البوت يعمل بـ Long Polling...');
+
+// ── الحارس المتبادل ────────────────────────────
 const GUARD_URL = process.env.GUARD_URL;
 if (GUARD_URL) {
   const ping = () => {
     fetch(GUARD_URL)
-      .then((res) => console.log(`Pinged guard: ${res.status}`))
-      .catch((err) => console.error('Guard ping failed:', err.message));
+      .then(res => console.log(`Pinged guard: ${res.status}`))
+      .catch(err => console.error('Guard unreachable:', err.message));
   };
   setInterval(ping, 30000);
   ping();
 }
 
-// ── إيقاف آمن عند إغلاق الخدمة ──
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
