@@ -114,10 +114,11 @@ async function sendStreamedReply(ctx, modelType, client, modelName, messages) {
   }
 }
 
-// ── توليد الصورة عبر Pollinations.ai ──────────
+// ── توليد الصورة عبر Pollinations.ai (محسّنة) ──
 async function generateImageUrl(prompt) {
   const encoded = encodeURIComponent(prompt);
-  return `https://image.pollinations.ai/prompt/${encoded}`;
+  // إضافة نموذج Flux وجودة 1024x1024 بدون شعار
+  return `https://image.pollinations.ai/prompt/${encoded}?model=flux&width=1024&height=1024&nologo=true`;
 }
 
 // ── أمر /start ──────────────────────────────────
@@ -145,7 +146,7 @@ bot.help((ctx) => {
     `• **/stats** – إحصائيات الاستخدام (للمالك فقط)\n\n` +
     `🔄 **السياق:** تذكر آخر 3 تبادلات لمدة 10 دقائق.\n` +
     `⚠️ **احتياطي:** عند فشل نموذج، ينتقل تلقائياً إلى الآخر.\n` +
-    `🖼️ **الصور:** مدعومة عبر Pollinations.ai (مجاني).`;
+    `🖼️ **الصور:** مدعومة عبر Pollinations.ai (مجاني، جودة عالية).`;
   ctx.reply(help, { parse_mode: 'Markdown' });
 });
 
@@ -199,8 +200,11 @@ bot.on('text', async (ctx) => {
 
     try {
       const imageUrl = await generateImageUrl(prompt);
-      // إرسال الصورة مباشرة من الرابط
-      await ctx.replyWithPhoto({ url: imageUrl }, { caption: `🖼️ ${prompt}` });
+      // إرسال الصورة مع توقيع البوت
+      await ctx.replyWithPhoto(
+        { url: imageUrl },
+        { caption: `🖼️ ${prompt}\n\nتم الانشاء بواسطة بوت @ysfaibot` }
+      );
       stats.images++;
       await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
     } catch (error) {
