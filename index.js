@@ -3,6 +3,8 @@ const { Telegraf } = require('telegraf');
 const Groq = require('groq-sdk');
 const OpenAI = require('openai');
 const express = require('express');
+const axios = require('axios');
+const cheerio = require('cheerio');
 
 // ── إعدادات ────────────────────────────────────
 const bot = new Telegraf(process.env.BOT_TOKEN);
@@ -49,6 +51,7 @@ const stats = {
   groq: { success: 0, fail: 0, totalTime: 0 },
   gemini: { success: 0, fail: 0, totalTime: 0 },
   images: 0,
+  summaries: 0,
   lastReset: Date.now(),
 };
 
@@ -61,6 +64,9 @@ function recordStat(model, success, duration) {
     s.fail++;
   }
 }
+
+// ── تخزين آخر برومت للصورة (لإعادة التوليد) ──
+const lastImagePrompt = new Map(); // userId -> prompt
 
 // ── دالة الرد المتدفق (Streaming) ─────────────
 async function sendStreamedReply(ctx, modelType, client, modelName, messages) {
@@ -114,25 +120,100 @@ async function sendStreamedReply(ctx, modelType, client, modelName, messages) {
   }
 }
 
-// ── توليد الصورة عبر Pollinations.ai (محسّنة) ──
+// ── توليد الصورة (محسّن) ──────────────────────
 async function generateImageUrl(prompt) {
   const encoded = encodeURIComponent(prompt);
-  // إضافة نموذج Flux وجودة 1024x1024 بدون شعار
   return `https://image.pollinations.ai/prompt/${encoded}?model=flux&width=1024&height=1024&nologo=true`;
 }
 
+// ── استخراج النص من رابط (لتلخيص المقالات) ────
+async function extractTextFromUrl(url) {
+  try {
+    const { data } = await axios.get(url, { timeout: 8000 });
+    const $ = cheerio.load(data);
+    // إزالة البرامج النصية والأنماط
+    $('script, style, nav, footer, header, aside').remove();
+    // استخراج النص من body أو article
+    const text = $('body').text().replace(/\s+/g, ' ').trim();
+    return text.substring(0, 3000); // أول 3000 حرف لتجنب طول السياق
+  } catch (e) {
+    console.error('فشل استخراج الرابط:', e.message);
+    return null;
+  }
+}
+
+// ── معالج الأزرار التفاعلية (Callback Query) ──
+bot.action(/^cmd_(.+)$/, async (ctx) => {
+  const action = ctx.match[1];
+  await ctx.answerCbQuery(); // إزالة علامة التحميل
+
+  if (action === 'gemini') {
+    ctx.reply('🧠 اكتب سؤالك بعد **/gemini**\nمثال: `/gemini ما هو الذكاء الاصطناعي؟`', { parse_mode: 'Markdown' });
+  } else if (action === 'groq') {
+    ctx.reply('⚡ اكتب سؤالك بعد **/groq**\nمثال: `/groq اشرح النظرية النسبية`', { parse_mode: 'Markdown' });
+  } else if (action === 'image') {
+    ctx.reply('🖼️ اكتب وصف الصورة بعد **/image**\nمثال: `/image منظر طبيعي لجبال`', { parse_mode: 'Markdown' });
+  } else if (action === 'help') {
+    ctx.reply('📘 استخدم **/help** لعرض جميع الأوامر.', { parse_mode: 'Markdown' });
+  }
+});
+
+// ── زر إعادة التوليد (للصور) ──────────────────
+bot.action('regen_image', async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = ctx.from.id;
+  const prompt = lastImagePrompt.get(userId);
+  if (!prompt) {
+    return ctx.reply('⚠️ لا يوجد وصف سابق لإعادة التوليد.');
+  }
+  // إرسال رسالة مؤقتة وتوليد الصورة
+  await ctx.sendChatAction('upload_photo');
+  const statusMsg = await ctx.reply('🎨 جارٍ إعادة توليد الصورة...');
+  try {
+    const imageUrl = await generateImageUrl(prompt);
+    await ctx.replyWithPhoto(
+      { url: imageUrl },
+      {
+        caption: `🖼️ ${prompt}\n\nتم الانشاء بواسطة بوت @ysfaibot`,
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🔄 إعادة التوليد', callback_data: 'regen_image' }],
+            [{ text: '⬇️ تحميل الصورة', url: imageUrl }]
+          ]
+        }
+      }
+    );
+    stats.images++;
+    await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+  } catch (error) {
+    console.error('خطأ في إعادة التوليد:', error.message);
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      statusMsg.message_id,
+      undefined,
+      '❌ فشلت إعادة التوليد. حاول لاحقاً.'
+    ).catch(() => {});
+  }
+});
+
 // ── أمر /start ──────────────────────────────────
 bot.start((ctx) => {
-  const welcome = `🌟 **مرحباً بك في البوت الذكي!**\n\n` +
-    `🔹 **/gemini سؤالك** ← ذكاء عميق (Google Gemini)\n` +
-    `🔹 **/groq سؤالك** ← سرعة فائقة (Groq)\n` +
-    `🖼️ **/image وصف الصورة** ← توليد صورة بالذكاء الاصطناعي\n\n` +
-    `📌 *مثال:* /gemini اشرح الثقوب السوداء\n` +
-    `📌 *مثال:* /groq اكتب دالة بايثون\n` +
-    `📌 *مثال:* /image قطة بيضاء تجلس على كرسي\n\n` +
-    `⚡ جرب النماذج المختلفة!\n` +
-    `ℹ️ استخدم /help لمعرفة كافة الأوامر.`;
-  ctx.reply(welcome, { parse_mode: 'Markdown' });
+  const welcome = `🌟 **مرحباً بك في البوت الذكي!**\n\nاختر إحدى الخدمات:`;
+  ctx.reply(welcome, {
+    parse_mode: 'Markdown',
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: '🧠 اسأل Gemini', callback_data: 'cmd_gemini' },
+          { text: '⚡ اسأل Groq', callback_data: 'cmd_groq' }
+        ],
+        [
+          { text: '🖼️ توليد صورة', callback_data: 'cmd_image' },
+          { text: 'ℹ️ مساعدة', callback_data: 'cmd_help' }
+        ]
+      ]
+    }
+  });
 });
 
 // ── أمر /help ──────────────────────────────────
@@ -141,12 +222,13 @@ bot.help((ctx) => {
     `• **/gemini [نص]** – اسأل نموذج Google Gemini (عميق)\n` +
     `• **/groq [نص]** – اسأل نموذج Groq (سريع)\n` +
     `• **/image [وصف]** – توليد صورة بالذكاء الاصطناعي\n` +
-    `• **/start** – رسالة الترحيب\n` +
+    `• **/start** – رسالة الترحيب مع أزرار تفاعلية\n` +
     `• **/help** – هذا الدليل\n` +
     `• **/stats** – إحصائيات الاستخدام (للمالك فقط)\n\n` +
     `🔄 **السياق:** تذكر آخر 3 تبادلات لمدة 10 دقائق.\n` +
     `⚠️ **احتياطي:** عند فشل نموذج، ينتقل تلقائياً إلى الآخر.\n` +
-    `🖼️ **الصور:** مدعومة عبر Pollinations.ai (مجاني، جودة عالية).`;
+    `🖼️ **الصور:** مدعومة عبر Pollinations.ai (مجاني، جودة عالية).\n` +
+    `📄 **تلخيص الروابط:** أرسل رابطاً لتلخيص المقال فوراً.`;
   ctx.reply(help, { parse_mode: 'Markdown' });
 });
 
@@ -168,6 +250,7 @@ bot.command('stats', (ctx) => {
     `⚡ **Groq:** ${stats.groq.success} نجاح | ${stats.groq.fail} فشل | متوسط ${groqAvg}ms\n` +
     `🧠 **Gemini:** ${stats.gemini.success} نجاح | ${stats.gemini.fail} فشل | متوسط ${geminiAvg}ms\n` +
     `🖼️ **الصور المولدة:** ${stats.images}\n` +
+    `📄 **التلخيصات:** ${stats.summaries}\n` +
     `🔄 **المستخدمين النشطين:** ${sessions.size}`;
   ctx.reply(report, { parse_mode: 'Markdown' });
 });
@@ -183,10 +266,53 @@ function extractQuestion(text, command) {
   return '';
 }
 
-// ── معالج الرسائل (النصوص + الصور) ────────────
+// ── معالج الرسائل النصية (الشامل) ──────────────
 bot.on('text', async (ctx) => {
   const text = ctx.message.text.trim();
   const userId = ctx.from.id;
+
+  // --- الكشف عن الروابط وتلخيصها (باستثناء الأوامر) ---
+  if (!text.startsWith('/')) {
+    const urlRegex = /(https?:\/\/[^\s]+)/g;
+    const urls = text.match(urlRegex);
+    if (urls && urls.length > 0) {
+      const url = urls[0]; // نأخذ الرابط الأول فقط
+      await ctx.sendChatAction('typing');
+      const statusMsg = await ctx.reply('📄 جارٍ استخراج النص من الرابط...');
+      const articleText = await extractTextFromUrl(url);
+      if (!articleText) {
+        await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, '❌ تعذر استخراج النص من الرابط. تأكد من أنه رابط مقال متاح للجميع.');
+        return;
+      }
+
+      // استخدام Groq للتلخيص (سريع ومجاني)
+      try {
+        const completion = await groq.chat.completions.create({
+          model: 'llama-3.3-70b-versatile',
+          messages: [
+            { role: 'system', content: 'أنت ملخص محترف. لخص النص التالي في فقرة أو فقرات قصيرة مع أبرز النقاط، باللغة العربية. استخدم Markdown وإيموجيز خفيفة.' },
+            { role: 'user', content: `لخص هذا النص:\n\n${articleText}` }
+          ],
+          stream: false,
+        });
+        const summary = completion.choices[0]?.message?.content || 'لم أستطع تلخيص النص.';
+        await ctx.telegram.editMessageText(
+          ctx.chat.id,
+          statusMsg.message_id,
+          undefined,
+          `📝 **تلخيص المقال**\n${summary}`,
+          { parse_mode: 'Markdown' }
+        );
+        stats.summaries++;
+      } catch (e) {
+        console.error('خطأ تلخيص:', e.message);
+        await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, '❌ فشل التلخيص. حاول لاحقاً.');
+      }
+      return; // خروج بعد معالجة الرابط
+    }
+    // إذا لم تكن رسالة أمر ولم تحتوِ على رابط، تجاهل (يمكن إضافة رد افتراضي هنا)
+    return;
+  }
 
   // --- /image ---
   if (text.startsWith('/image')) {
@@ -195,15 +321,25 @@ bot.on('text', async (ctx) => {
       return ctx.reply('🖼️ اكتب وصف الصورة بعد /image\nمثال: /image قطة بيضاء تجلس على كرسي');
     }
 
+    // حفظ البرومت لإعادة التوليد
+    lastImagePrompt.set(userId, prompt);
+
     await ctx.sendChatAction('upload_photo');
     const statusMsg = await ctx.reply('🎨 جارٍ توليد الصورة...');
 
     try {
       const imageUrl = await generateImageUrl(prompt);
-      // إرسال الصورة مع توقيع البوت
       await ctx.replyWithPhoto(
         { url: imageUrl },
-        { caption: `🖼️ ${prompt}\n\nتم الانشاء بواسطة بوت @ysfaibot` }
+        {
+          caption: `🖼️ ${prompt}\n\nتم الانشاء بواسطة بوت @ysfaibot`,
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🔄 إعادة التوليد', callback_data: 'regen_image' }],
+              [{ text: '⬇️ تحميل الصورة', url: imageUrl }]
+            ]
+          }
+        }
       );
       stats.images++;
       await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
