@@ -6,23 +6,23 @@ const express = require('express');
 
 // ── إعدادات ────────────────────────────────────
 const bot = new Telegraf(process.env.BOT_TOKEN);
-const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID; // رقم شات المالك (رقمي، مثل 123456789)
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID; // رقم شات المالك (رقمي)
 
-// ── عملاء API ───────────────────────────────────
+// ── عملاء API للنصوص ──────────────────────────
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 let gemini = null;
 if (process.env.GEMINI_API_KEY) {
   gemini = new OpenAI({
     apiKey: process.env.GEMINI_API_KEY,
-    baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai', // بدون شرطة مائلة في النهاية
+    baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai',
   });
 }
 
-// ── ذاكرة المحادثة (سياق بسيط) ────────────────
+// ── ذاكرة المحادثة (سياق) ─────────────────────
 const sessions = new Map();
 const SESSION_TTL = 10 * 60 * 1000; // 10 دقائق
-const MAX_HISTORY = 6; // آخر 3 تبادلات
+const MAX_HISTORY = 6;
 
 function getSession(userId) {
   const now = Date.now();
@@ -44,10 +44,11 @@ function addMessageToSession(userId, role, content) {
   }
 }
 
-// ── إحصائيات بسيطة ────────────────────────────
+// ── إحصائيات ──────────────────────────────────
 const stats = {
   groq: { success: 0, fail: 0, totalTime: 0 },
   gemini: { success: 0, fail: 0, totalTime: 0 },
+  images: 0,
   lastReset: Date.now(),
 };
 
@@ -113,14 +114,22 @@ async function sendStreamedReply(ctx, modelType, client, modelName, messages) {
   }
 }
 
+// ── توليد الصورة عبر Pollinations.ai ──────────
+async function generateImageUrl(prompt) {
+  const encoded = encodeURIComponent(prompt);
+  return `https://image.pollinations.ai/prompt/${encoded}`;
+}
+
 // ── أمر /start ──────────────────────────────────
 bot.start((ctx) => {
   const welcome = `🌟 **مرحباً بك في البوت الذكي!**\n\n` +
     `🔹 **/gemini سؤالك** ← ذكاء عميق (Google Gemini)\n` +
-    `🔹 **/groq سؤالك** ← سرعة فائقة (Groq)\n\n` +
+    `🔹 **/groq سؤالك** ← سرعة فائقة (Groq)\n` +
+    `🖼️ **/image وصف الصورة** ← توليد صورة بالذكاء الاصطناعي\n\n` +
     `📌 *مثال:* /gemini اشرح الثقوب السوداء\n` +
-    `📌 *مثال:* /groq اكتب دالة بايثون لترتيب قائمة\n\n` +
-    `⚡ جرب كلا النموذجين وقارن!\n` +
+    `📌 *مثال:* /groq اكتب دالة بايثون\n` +
+    `📌 *مثال:* /image قطة بيضاء تجلس على كرسي\n\n` +
+    `⚡ جرب النماذج المختلفة!\n` +
     `ℹ️ استخدم /help لمعرفة كافة الأوامر.`;
   ctx.reply(welcome, { parse_mode: 'Markdown' });
 });
@@ -130,11 +139,13 @@ bot.help((ctx) => {
   const help = `📘 **دليل الاستخدام**\n\n` +
     `• **/gemini [نص]** – اسأل نموذج Google Gemini (عميق)\n` +
     `• **/groq [نص]** – اسأل نموذج Groq (سريع)\n` +
+    `• **/image [وصف]** – توليد صورة بالذكاء الاصطناعي\n` +
     `• **/start** – رسالة الترحيب\n` +
     `• **/help** – هذا الدليل\n` +
     `• **/stats** – إحصائيات الاستخدام (للمالك فقط)\n\n` +
-    `🔄 **ميزة السياق:** يستطيع البوت تذكر آخر 3 تبادلات لمدة 10 دقائق.\n` +
-    `⚠️ **احتياطي:** إذا فشل نموذج، ينتقل تلقائياً إلى الآخر.`;
+    `🔄 **السياق:** تذكر آخر 3 تبادلات لمدة 10 دقائق.\n` +
+    `⚠️ **احتياطي:** عند فشل نموذج، ينتقل تلقائياً إلى الآخر.\n` +
+    `🖼️ **الصور:** مدعومة عبر Pollinations.ai (مجاني).`;
   ctx.reply(help, { parse_mode: 'Markdown' });
 });
 
@@ -155,11 +166,12 @@ bot.command('stats', (ctx) => {
   const report = `📊 **إحصائيات البوت** (آخر ${uptimeMins} دقيقة)\n\n` +
     `⚡ **Groq:** ${stats.groq.success} نجاح | ${stats.groq.fail} فشل | متوسط ${groqAvg}ms\n` +
     `🧠 **Gemini:** ${stats.gemini.success} نجاح | ${stats.gemini.fail} فشل | متوسط ${geminiAvg}ms\n` +
-    `🔄 **الذاكرة:** ${sessions.size} مستخدم نشط`;
+    `🖼️ **الصور المولدة:** ${stats.images}\n` +
+    `🔄 **المستخدمين النشطين:** ${sessions.size}`;
   ctx.reply(report, { parse_mode: 'Markdown' });
 });
 
-// ── استخراج السؤال بعد الأمر ──────────────────
+// ── استخراج النص بعد الأمر ──────────────────
 function extractQuestion(text, command) {
   if (text.startsWith(command + ' ')) {
     return text.slice(command.length + 1).trim();
@@ -170,11 +182,40 @@ function extractQuestion(text, command) {
   return '';
 }
 
-// ── معالج الرسائل الأساسي ─────────────────────
+// ── معالج الرسائل (النصوص + الصور) ────────────
 bot.on('text', async (ctx) => {
   const text = ctx.message.text.trim();
   const userId = ctx.from.id;
 
+  // --- /image ---
+  if (text.startsWith('/image')) {
+    const prompt = extractQuestion(text, '/image');
+    if (!prompt) {
+      return ctx.reply('🖼️ اكتب وصف الصورة بعد /image\nمثال: /image قطة بيضاء تجلس على كرسي');
+    }
+
+    await ctx.sendChatAction('upload_photo');
+    const statusMsg = await ctx.reply('🎨 جارٍ توليد الصورة...');
+
+    try {
+      const imageUrl = await generateImageUrl(prompt);
+      // إرسال الصورة مباشرة من الرابط
+      await ctx.replyWithPhoto({ url: imageUrl }, { caption: `🖼️ ${prompt}` });
+      stats.images++;
+      await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+    } catch (error) {
+      console.error('خطأ في توليد الصورة:', error.message);
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        statusMsg.message_id,
+        undefined,
+        '❌ فشل توليد الصورة. حاول لاحقاً.'
+      ).catch(() => {});
+    }
+    return;
+  }
+
+  // --- /gemini و /groq (النصوص) ---
   if (!text.startsWith('/gemini') && !text.startsWith('/groq')) return;
 
   const isGemini = text.startsWith('/gemini');
@@ -215,7 +256,7 @@ bot.on('text', async (ctx) => {
       return;
     }
 
-    const success = await executeRequest('gemini', gemini, 'gemini-2.5-flash'); // تم التحديث
+    const success = await executeRequest('gemini', gemini, 'gemini-2.5-flash');
     if (!success) {
       ctx.reply('⚠️ تعذر الاتصال بـ Gemini. جاري تحويل طلبك إلى Groq...');
       const groqSuccess = await executeRequest('groq', groq, 'llama-3.3-70b-versatile');
@@ -226,7 +267,7 @@ bot.on('text', async (ctx) => {
     if (!success) {
       if (gemini) {
         ctx.reply('⚠️ تعذر الاتصال بـ Groq. جاري تحويل طلبك إلى Gemini...');
-        const gemSuccess = await executeRequest('gemini', gemini, 'gemini-2.5-flash'); // تم التحديث
+        const gemSuccess = await executeRequest('gemini', gemini, 'gemini-2.5-flash');
         if (!gemSuccess) ctx.reply('❌ فشل كلا النموذجين. حاول لاحقاً.');
       } else {
         ctx.reply('❌ فشل نموذج Groq ولا يوجد نموذج بديل.');
@@ -245,7 +286,7 @@ app.get('/test-gemini', async (_, res) => {
   if (!gemini) return res.send('Gemini غير مهيأ: لا يوجد GEMINI_API_KEY');
   try {
     const response = await gemini.chat.completions.create({
-      model: 'gemini-2.5-flash', // تم التحديث
+      model: 'gemini-2.5-flash',
       messages: [{ role: 'user', content: 'قل مرحباً بالعربية' }],
     });
     res.send(`✅ نجح Gemini: ${response.choices[0].message.content}`);
