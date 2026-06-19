@@ -8,22 +8,30 @@ const cheerio = require('cheerio');
 
 // ── إعدادات ────────────────────────────────────
 const bot = new Telegraf(process.env.BOT_TOKEN);
-const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID; // رقم شات المالك (رقمي)
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
 
-// ── عملاء API للنصوص ──────────────────────────
+// ── عملاء Groq ────────────────────────────────
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-let gemini = null;
+// ── عملاء Gemini (مفتاحان) ────────────────────
+let gemini1 = null;
+let gemini2 = null;
 if (process.env.GEMINI_API_KEY) {
-  gemini = new OpenAI({
+  gemini1 = new OpenAI({
     apiKey: process.env.GEMINI_API_KEY,
+    baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai',
+  });
+}
+if (process.env.GEMINI_API_KEY2) {
+  gemini2 = new OpenAI({
+    apiKey: process.env.GEMINI_API_KEY2,
     baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai',
   });
 }
 
 // ── ذاكرة المحادثة (سياق) ─────────────────────
 const sessions = new Map();
-const SESSION_TTL = 10 * 60 * 1000; // 10 دقائق
+const SESSION_TTL = 10 * 60 * 1000;
 const MAX_HISTORY = 6;
 
 function getSession(userId) {
@@ -66,59 +74,7 @@ function recordStat(model, success, duration) {
 }
 
 // ── تخزين آخر برومت للصورة (لإعادة التوليد) ──
-const lastImagePrompt = new Map(); // userId -> prompt
-
-// ── دالة الرد المتدفق (Streaming) ─────────────
-async function sendStreamedReply(ctx, modelType, client, modelName, messages) {
-  const loadingMsg = await ctx.reply('⏳ جارٍ التفكير...');
-  let fullText = '';
-
-  try {
-    const stream = await client.chat.completions.create({
-      model: modelName,
-      messages,
-      stream: true,
-    });
-
-    let updateCounter = 0;
-    for await (const chunk of stream) {
-      const content = chunk.choices[0]?.delta?.content || '';
-      fullText += content;
-      updateCounter++;
-      if (updateCounter % 5 === 0 && fullText.length > 0) {
-        await ctx.telegram.editMessageText(
-          ctx.chat.id,
-          loadingMsg.message_id,
-          undefined,
-          fullText,
-          { parse_mode: 'Markdown' }
-        ).catch(() => {});
-      }
-    }
-
-    if (fullText.length > 0) {
-      await ctx.telegram.editMessageText(
-        ctx.chat.id,
-        loadingMsg.message_id,
-        undefined,
-        fullText,
-        { parse_mode: 'Markdown' }
-      ).catch(() => {});
-    } else {
-      await ctx.telegram.editMessageText(
-        ctx.chat.id,
-        loadingMsg.message_id,
-        undefined,
-        '❌ لم أحصل على رد.',
-      ).catch(() => {});
-    }
-
-    return fullText;
-  } catch (e) {
-    await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
-    throw e;
-  }
-}
+const lastImagePrompt = new Map();
 
 // ── توليد الصورة (محسّن) ──────────────────────
 async function generateImageUrl(prompt) {
@@ -131,22 +87,19 @@ async function extractTextFromUrl(url) {
   try {
     const { data } = await axios.get(url, { timeout: 8000 });
     const $ = cheerio.load(data);
-    // إزالة البرامج النصية والأنماط
     $('script, style, nav, footer, header, aside').remove();
-    // استخراج النص من body أو article
     const text = $('body').text().replace(/\s+/g, ' ').trim();
-    return text.substring(0, 3000); // أول 3000 حرف لتجنب طول السياق
+    return text.substring(0, 3000);
   } catch (e) {
     console.error('فشل استخراج الرابط:', e.message);
     return null;
   }
 }
 
-// ── معالج الأزرار التفاعلية (Callback Query) ──
+// ── معالج الأزرار التفاعلية ──────────────────
 bot.action(/^cmd_(.+)$/, async (ctx) => {
   const action = ctx.match[1];
-  await ctx.answerCbQuery(); // إزالة علامة التحميل
-
+  await ctx.answerCbQuery();
   if (action === 'gemini') {
     ctx.reply('🧠 اكتب سؤالك بعد **/gemini**\nمثال: `/gemini ما هو الذكاء الاصطناعي؟`', { parse_mode: 'Markdown' });
   } else if (action === 'groq') {
@@ -158,15 +111,11 @@ bot.action(/^cmd_(.+)$/, async (ctx) => {
   }
 });
 
-// ── زر إعادة التوليد (للصور) ──────────────────
 bot.action('regen_image', async (ctx) => {
   await ctx.answerCbQuery();
   const userId = ctx.from.id;
   const prompt = lastImagePrompt.get(userId);
-  if (!prompt) {
-    return ctx.reply('⚠️ لا يوجد وصف سابق لإعادة التوليد.');
-  }
-  // إرسال رسالة مؤقتة وتوليد الصورة
+  if (!prompt) return ctx.reply('⚠️ لا يوجد وصف سابق لإعادة التوليد.');
   await ctx.sendChatAction('upload_photo');
   const statusMsg = await ctx.reply('🎨 جارٍ إعادة توليد الصورة...');
   try {
@@ -187,12 +136,7 @@ bot.action('regen_image', async (ctx) => {
     await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
   } catch (error) {
     console.error('خطأ في إعادة التوليد:', error.message);
-    await ctx.telegram.editMessageText(
-      ctx.chat.id,
-      statusMsg.message_id,
-      undefined,
-      '❌ فشلت إعادة التوليد. حاول لاحقاً.'
-    ).catch(() => {});
+    await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, '❌ فشلت إعادة التوليد. حاول لاحقاً.').catch(() => {});
   }
 });
 
@@ -271,12 +215,12 @@ bot.on('text', async (ctx) => {
   const text = ctx.message.text.trim();
   const userId = ctx.from.id;
 
-  // --- الكشف عن الروابط وتلخيصها (باستثناء الأوامر) ---
+  // --- الكشف عن الروابط وتلخيصها ---
   if (!text.startsWith('/')) {
     const urlRegex = /(https?:\/\/[^\s]+)/g;
     const urls = text.match(urlRegex);
     if (urls && urls.length > 0) {
-      const url = urls[0]; // نأخذ الرابط الأول فقط
+      const url = urls[0];
       await ctx.sendChatAction('typing');
       const statusMsg = await ctx.reply('📄 جارٍ استخراج النص من الرابط...');
       const articleText = await extractTextFromUrl(url);
@@ -284,8 +228,6 @@ bot.on('text', async (ctx) => {
         await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, '❌ تعذر استخراج النص من الرابط. تأكد من أنه رابط مقال متاح للجميع.');
         return;
       }
-
-      // استخدام Groq للتلخيص (سريع ومجاني)
       try {
         const completion = await groq.chat.completions.create({
           model: 'llama-3.3-70b-versatile',
@@ -308,9 +250,9 @@ bot.on('text', async (ctx) => {
         console.error('خطأ تلخيص:', e.message);
         await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, '❌ فشل التلخيص. حاول لاحقاً.');
       }
-      return; // خروج بعد معالجة الرابط
+      return;
     }
-    // إذا لم تكن رسالة أمر ولم تحتوِ على رابط، تجاهل (يمكن إضافة رد افتراضي هنا)
+    // تجاهل باقي الرسائل غير الأوامر
     return;
   }
 
@@ -320,13 +262,9 @@ bot.on('text', async (ctx) => {
     if (!prompt) {
       return ctx.reply('🖼️ اكتب وصف الصورة بعد /image\nمثال: /image قطة بيضاء تجلس على كرسي');
     }
-
-    // حفظ البرومت لإعادة التوليد
     lastImagePrompt.set(userId, prompt);
-
     await ctx.sendChatAction('upload_photo');
     const statusMsg = await ctx.reply('🎨 جارٍ توليد الصورة...');
-
     try {
       const imageUrl = await generateImageUrl(prompt);
       await ctx.replyWithPhoto(
@@ -345,12 +283,7 @@ bot.on('text', async (ctx) => {
       await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
     } catch (error) {
       console.error('خطأ في توليد الصورة:', error.message);
-      await ctx.telegram.editMessageText(
-        ctx.chat.id,
-        statusMsg.message_id,
-        undefined,
-        '❌ فشل توليد الصورة. حاول لاحقاً.'
-      ).catch(() => {});
+      await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, '❌ فشل توليد الصورة. حاول لاحقاً.').catch(() => {});
     }
     return;
   }
@@ -370,15 +303,24 @@ bot.on('text', async (ctx) => {
   const systemMessage = { role: 'system', content: 'أنت مساعد خبير، أجب بإجابات واضحة ومنسقة باستخدام Markdown مع إيموجيز خفيفة.' };
   const messages = [systemMessage, ...session.messages, { role: 'user', content: question }];
 
+  // دالة تنفيذ طلب نصي (بدون streaming)
   const executeRequest = async (modelType, client, modelName) => {
     const start = Date.now();
     try {
       await ctx.sendChatAction('typing');
-      const reply = await sendStreamedReply(ctx, modelType, client, modelName, messages);
+      const completion = await client.chat.completions.create({
+        model: modelName,
+        messages,
+        stream: false,
+      });
+      const reply = completion.choices[0]?.message?.content || 'لم أحصل على رد.';
+      // حفظ السياق
       addMessageToSession(userId, 'user', question);
       addMessageToSession(userId, 'assistant', reply);
       const duration = Date.now() - start;
       recordStat(modelType, true, duration);
+      // إرسال الرد كاملاً
+      await ctx.reply(reply, { parse_mode: 'Markdown' });
       return true;
     } catch (error) {
       const duration = Date.now() - start;
@@ -389,26 +331,40 @@ bot.on('text', async (ctx) => {
   };
 
   if (isGemini) {
-    if (!gemini) {
-      ctx.reply('⚠️ نموذج Gemini غير مفعل. جاري استخدام Groq بدلاً منه...');
-      const success = await executeRequest('groq', groq, 'llama-3.3-70b-versatile');
-      if (!success) ctx.reply('❌ فشل كلا النموذجين. حاول لاحقاً.');
-      return;
+    // محاولة Gemini عبر المفتاح الأول
+    let success = false;
+    if (gemini1) {
+      success = await executeRequest('gemini', gemini1, 'gemini-2.5-flash');
+    }
+    if (!success && gemini2) {
+      console.log('محاولة استخدام GEMINI_API_KEY2...');
+      success = await executeRequest('gemini', gemini2, 'gemini-2.5-flash');
     }
 
-    const success = await executeRequest('gemini', gemini, 'gemini-2.5-flash');
     if (!success) {
-      ctx.reply('⚠️ تعذر الاتصال بـ Gemini. جاري تحويل طلبك إلى Groq...');
+      // فشل كلا المفتاحين – الانتقال إلى Groq
+      const message = gemini1 || gemini2
+        ? '⚠️ تعذر الاتصال بـ Gemini. جاري تحويل طلبك إلى Groq...'
+        : '⚠️ نموذج Gemini غير مفعل. جاري استخدام Groq بدلاً منه...';
+      ctx.reply(message);
       const groqSuccess = await executeRequest('groq', groq, 'llama-3.3-70b-versatile');
       if (!groqSuccess) ctx.reply('❌ فشل كلا النموذجين. حاول لاحقاً.');
     }
   } else {
+    // طلب Groq مباشرة
     const success = await executeRequest('groq', groq, 'llama-3.3-70b-versatile');
     if (!success) {
-      if (gemini) {
+      // إذا فشل Groq، نجرب Gemini (بالمفتاحين)
+      if (gemini1 || gemini2) {
         ctx.reply('⚠️ تعذر الاتصال بـ Groq. جاري تحويل طلبك إلى Gemini...');
-        const gemSuccess = await executeRequest('gemini', gemini, 'gemini-2.5-flash');
-        if (!gemSuccess) ctx.reply('❌ فشل كلا النموذجين. حاول لاحقاً.');
+        let geminiSuccess = false;
+        if (gemini1) {
+          geminiSuccess = await executeRequest('gemini', gemini1, 'gemini-2.5-flash');
+        }
+        if (!geminiSuccess && gemini2) {
+          geminiSuccess = await executeRequest('gemini', gemini2, 'gemini-2.5-flash');
+        }
+        if (!geminiSuccess) ctx.reply('❌ فشل كلا النموذجين. حاول لاحقاً.');
       } else {
         ctx.reply('❌ فشل نموذج Groq ولا يوجد نموذج بديل.');
       }
@@ -416,16 +372,17 @@ bot.on('text', async (ctx) => {
   }
 });
 
-// ── خادم Express (للصحة والحارس) ──────────────
+// ── خادم Express ──────────────────────────────
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.get('/', (_, res) => res.send('Bot is alive'));
 
 app.get('/test-gemini', async (_, res) => {
-  if (!gemini) return res.send('Gemini غير مهيأ: لا يوجد GEMINI_API_KEY');
+  const client = gemini1 || gemini2;
+  if (!client) return res.send('لا يوجد أي مفتاح Gemini');
   try {
-    const response = await gemini.chat.completions.create({
+    const response = await client.chat.completions.create({
       model: 'gemini-2.5-flash',
       messages: [{ role: 'user', content: 'قل مرحباً بالعربية' }],
     });
