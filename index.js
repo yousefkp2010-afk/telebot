@@ -15,7 +15,7 @@ let gemini = null;
 if (process.env.GEMINI_API_KEY) {
   gemini = new OpenAI({
     apiKey: process.env.GEMINI_API_KEY,
-    baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai', // تم الإصلاح: بدون شرطة مائلة في النهاية
+    baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai', // بدون شرطة مائلة في النهاية
   });
 }
 
@@ -215,7 +215,7 @@ bot.on('text', async (ctx) => {
       return;
     }
 
-    const success = await executeRequest('gemini', gemini, 'gemini-1.5-pro');
+    const success = await executeRequest('gemini', gemini, 'gemini-2.5-flash'); // تم التحديث
     if (!success) {
       ctx.reply('⚠️ تعذر الاتصال بـ Gemini. جاري تحويل طلبك إلى Groq...');
       const groqSuccess = await executeRequest('groq', groq, 'llama-3.3-70b-versatile');
@@ -226,7 +226,7 @@ bot.on('text', async (ctx) => {
     if (!success) {
       if (gemini) {
         ctx.reply('⚠️ تعذر الاتصال بـ Groq. جاري تحويل طلبك إلى Gemini...');
-        const gemSuccess = await executeRequest('gemini', gemini, 'gemini-1.5-pro');
+        const gemSuccess = await executeRequest('gemini', gemini, 'gemini-2.5-flash'); // تم التحديث
         if (!gemSuccess) ctx.reply('❌ فشل كلا النموذجين. حاول لاحقاً.');
       } else {
         ctx.reply('❌ فشل نموذج Groq ولا يوجد نموذج بديل.');
@@ -245,7 +245,7 @@ app.get('/test-gemini', async (_, res) => {
   if (!gemini) return res.send('Gemini غير مهيأ: لا يوجد GEMINI_API_KEY');
   try {
     const response = await gemini.chat.completions.create({
-      model: 'gemini-1.5-pro',
+      model: 'gemini-2.5-flash', // تم التحديث
       messages: [{ role: 'user', content: 'قل مرحباً بالعربية' }],
     });
     res.send(`✅ نجح Gemini: ${response.choices[0].message.content}`);
