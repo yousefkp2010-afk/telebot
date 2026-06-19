@@ -6,7 +6,7 @@ const express = require('express');
 
 // ── إعدادات ────────────────────────────────────
 const bot = new Telegraf(process.env.BOT_TOKEN);
-const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID; // رقم شات المالك للإحصائيات
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID; // رقم شات المالك (رقمي، مثل 123456789)
 
 // ── عملاء API ───────────────────────────────────
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
@@ -15,14 +15,14 @@ let gemini = null;
 if (process.env.GEMINI_API_KEY) {
   gemini = new OpenAI({
     apiKey: process.env.GEMINI_API_KEY,
-    baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
+    baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai', // تم الإصلاح: بدون شرطة مائلة في النهاية
   });
 }
 
 // ── ذاكرة المحادثة (سياق بسيط) ────────────────
-const sessions = new Map(); // مفتاح: userId, قيمة: { messages: [], lastActive: timestamp }
+const sessions = new Map();
 const SESSION_TTL = 10 * 60 * 1000; // 10 دقائق
-const MAX_HISTORY = 6; // عدد الرسائل المحفوظة (زوجي: 3 تبادلات)
+const MAX_HISTORY = 6; // آخر 3 تبادلات
 
 function getSession(userId) {
   const now = Date.now();
@@ -62,7 +62,7 @@ function recordStat(model, success, duration) {
 }
 
 // ── دالة الرد المتدفق (Streaming) ─────────────
-async function sendStreamedReply(ctx, model, client, modelName, messages) {
+async function sendStreamedReply(ctx, modelType, client, modelName, messages) {
   const loadingMsg = await ctx.reply('⏳ جارٍ التفكير...');
   let fullText = '';
 
@@ -78,7 +78,6 @@ async function sendStreamedReply(ctx, model, client, modelName, messages) {
       const content = chunk.choices[0]?.delta?.content || '';
       fullText += content;
       updateCounter++;
-      // تحديث الرسالة كل 5 كلمات لتجنب الـ Rate Limit
       if (updateCounter % 5 === 0 && fullText.length > 0) {
         await ctx.telegram.editMessageText(
           ctx.chat.id,
@@ -90,7 +89,6 @@ async function sendStreamedReply(ctx, model, client, modelName, messages) {
       }
     }
 
-    // التحديث النهائي
     if (fullText.length > 0) {
       await ctx.telegram.editMessageText(
         ctx.chat.id,
@@ -100,7 +98,6 @@ async function sendStreamedReply(ctx, model, client, modelName, messages) {
         { parse_mode: 'Markdown' }
       ).catch(() => {});
     } else {
-      // لو ما وصل شيء
       await ctx.telegram.editMessageText(
         ctx.chat.id,
         loadingMsg.message_id,
@@ -109,15 +106,14 @@ async function sendStreamedReply(ctx, model, client, modelName, messages) {
       ).catch(() => {});
     }
 
-    return fullText; // ناجح
+    return fullText;
   } catch (e) {
-    // حذف رسالة التحميل وإظهار الخطأ
     await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id).catch(() => {});
-    throw e; // نعيد الخطأ ليعالجه الـ fallback
+    throw e;
   }
 }
 
-// ── معالج الأوامر /start ──────────────────────
+// ── أمر /start ──────────────────────────────────
 bot.start((ctx) => {
   const welcome = `🌟 **مرحباً بك في البوت الذكي!**\n\n` +
     `🔹 **/gemini سؤالك** ← ذكاء عميق (Google Gemini)\n` +
@@ -165,7 +161,6 @@ bot.command('stats', (ctx) => {
 
 // ── استخراج السؤال بعد الأمر ──────────────────
 function extractQuestion(text, command) {
-  // إزالة الأمر والمسافة التي تليه
   if (text.startsWith(command + ' ')) {
     return text.slice(command.length + 1).trim();
   }
@@ -175,15 +170,13 @@ function extractQuestion(text, command) {
   return '';
 }
 
-// ── قلب البوت: معالج الرسائل ──────────────────
+// ── معالج الرسائل الأساسي ─────────────────────
 bot.on('text', async (ctx) => {
   const text = ctx.message.text.trim();
   const userId = ctx.from.id;
 
-  // تجاهل أي رسالة لا تبدأ بـ /gemini أو /groq
   if (!text.startsWith('/gemini') && !text.startsWith('/groq')) return;
 
-  // تحديد النموذج المطلوب
   const isGemini = text.startsWith('/gemini');
   const command = isGemini ? '/gemini' : '/groq';
   const question = extractQuestion(text, command);
@@ -192,18 +185,15 @@ bot.on('text', async (ctx) => {
     return ctx.reply(`❓ اكتب سؤالك بعد ${command}\nمثال: ${command} ما هو الذكاء الاصطناعي؟`);
   }
 
-  // تحضير السياق
   const session = getSession(userId);
   const systemMessage = { role: 'system', content: 'أنت مساعد خبير، أجب بإجابات واضحة ومنسقة باستخدام Markdown مع إيموجيز خفيفة.' };
   const messages = [systemMessage, ...session.messages, { role: 'user', content: question }];
 
-  // دالة تنفيذ الطلب مع قياس الزمن
   const executeRequest = async (modelType, client, modelName) => {
     const start = Date.now();
     try {
       await ctx.sendChatAction('typing');
       const reply = await sendStreamedReply(ctx, modelType, client, modelName, messages);
-      // حفظ السؤال والرد في السياق
       addMessageToSession(userId, 'user', question);
       addMessageToSession(userId, 'assistant', reply);
       const duration = Date.now() - start;
@@ -217,10 +207,8 @@ bot.on('text', async (ctx) => {
     }
   };
 
-  // المحاولة الأولى: النموذج الذي اختاره المستخدم
   if (isGemini) {
     if (!gemini) {
-      // لا يوجد مفتاح Gemini، نجرب Groq مباشرة مع إعلام المستخدم
       ctx.reply('⚠️ نموذج Gemini غير مفعل. جاري استخدام Groq بدلاً منه...');
       const success = await executeRequest('groq', groq, 'llama-3.3-70b-versatile');
       if (!success) ctx.reply('❌ فشل كلا النموذجين. حاول لاحقاً.');
@@ -229,18 +217,13 @@ bot.on('text', async (ctx) => {
 
     const success = await executeRequest('gemini', gemini, 'gemini-1.5-pro');
     if (!success) {
-      // Fallback إلى Groq
       ctx.reply('⚠️ تعذر الاتصال بـ Gemini. جاري تحويل طلبك إلى Groq...');
       const groqSuccess = await executeRequest('groq', groq, 'llama-3.3-70b-versatile');
-      if (!groqSuccess) {
-        ctx.reply('❌ فشل كلا النموذجين. حاول لاحقاً.');
-      }
+      if (!groqSuccess) ctx.reply('❌ فشل كلا النموذجين. حاول لاحقاً.');
     }
   } else {
-    // Groq مباشرة
     const success = await executeRequest('groq', groq, 'llama-3.3-70b-versatile');
     if (!success) {
-      // إذا فشل Groq، ننتقل إلى Gemini إن وُجد
       if (gemini) {
         ctx.reply('⚠️ تعذر الاتصال بـ Groq. جاري تحويل طلبك إلى Gemini...');
         const gemSuccess = await executeRequest('gemini', gemini, 'gemini-1.5-pro');
@@ -252,7 +235,7 @@ bot.on('text', async (ctx) => {
   }
 });
 
-// ── خادم Express (نقطة صحية + اختبار Gemini) ──
+// ── خادم Express (للصحة والحارس) ──────────────
 const app = express();
 const PORT = process.env.PORT || 3000;
 
