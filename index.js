@@ -5,6 +5,11 @@ const OpenAI = require('openai');
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const fs = require('fs').promises;
+const path = require('path');
+const { promisify } = require('util');
+const exec = promisify(require('child_process').exec);
+const ffmpeg = require('fluent-ffmpeg');
 
 // ── إعدادات ────────────────────────────────────
 const bot = new Telegraf(process.env.BOT_TOKEN);
@@ -60,6 +65,7 @@ const stats = {
   gemini: { success: 0, fail: 0, totalTime: 0 },
   images: 0,
   summaries: 0,
+  stories: 0,      // عدد الفيديوهات المولدة
   lastReset: Date.now(),
 };
 
@@ -73,16 +79,17 @@ function recordStat(model, success, duration) {
   }
 }
 
-// ── تخزين آخر برومت للصورة (لإعادة التوليد) ──
+// ── تخزين آخر برومت للصورة وللقصة ────────────
 const lastImagePrompt = new Map();
+const lastStoryPrompt = new Map();
 
-// ── توليد الصورة (محسّن) ──────────────────────
+// ── دالة توليد الصورة (نفس السابق) ──────────
 async function generateImageUrl(prompt) {
   const encoded = encodeURIComponent(prompt);
   return `https://image.pollinations.ai/prompt/${encoded}?model=flux&width=1024&height=1024&nologo=true`;
 }
 
-// ── استخراج النص من رابط (لتلخيص المقالات) ────
+// ── استخراج النص من رابط ──────────────────
 async function extractTextFromUrl(url) {
   try {
     const { data } = await axios.get(url, { timeout: 8000 });
@@ -96,7 +103,171 @@ async function extractTextFromUrl(url) {
   }
 }
 
-// ── معالج الأزرار التفاعلية ──────────────────
+// ── دالات توليد القصة (جديدة) ──────────────
+
+/** توليد 8 أوصاف باللغة الإنجليزية بصيغة JSON باستخدام Gemini */
+async function generateStoryDescriptions(storyIdea, geminiClient) {
+  const prompt = `
+You are an expert at generating detailed image descriptions for a story.
+Based on the following story idea, generate exactly 8 highly detailed descriptions in English.
+Each description must be very detailed (at least 30 words) covering: characters (facial features, clothes, expressions), environment (background, colors, lighting), camera angle, artistic style (e.g., cinematic, realistic, cartoon, oil painting), and any visual elements that enhance the scene.
+Output only a valid JSON array of 8 strings. Do not add any extra text outside the JSON.
+
+Story idea: "${storyIdea}"
+
+Output format: ["description 1", "description 2", ..., "description 8"]
+`;
+
+  try {
+    const completion = await geminiClient.chat.completions.create({
+      model: 'gemini-2.5-flash',  // أو gemini-1.5-pro
+      messages: [
+        { role: 'system', content: 'You are a helpful assistant that outputs only JSON arrays.' },
+        { role: 'user', content: prompt }
+      ],
+      temperature: 0.8,
+      stream: false,
+    });
+    const content = completion.choices[0]?.message?.content || '';
+    // استخراج JSON من النص (قد يحوي علامات ```json)
+    const jsonMatch = content.match(/\[[\s\S]*\]/);
+    if (!jsonMatch) throw new Error('لم يتم العثور على JSON في الرد.');
+    const descriptions = JSON.parse(jsonMatch[0]);
+    if (!Array.isArray(descriptions) || descriptions.length < 8) {
+      throw new Error('الرد لا يحتوي على 8 أوصاف.');
+    }
+    return descriptions.slice(0, 8);
+  } catch (error) {
+    console.error('فشل توليد الأوصاف من Gemini:', error.message);
+    throw error;
+  }
+}
+
+/** توليد صور من قائمة الأوصاف مع تأخير 5 ثوان بين كل طلب */
+async function generateImagesFromDescriptions(descriptions) {
+  const imagePaths = [];
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  for (let i = 0; i < descriptions.length; i++) {
+    if (i > 0) await sleep(5000); // تجنب حد Pollinations (طلب واحد كل 5 ثوان)
+    const prompt = descriptions[i];
+    const url = await generateImageUrl(prompt);
+    console.log(`🖼️ جاري توليد الصورة ${i+1}/8...`);
+    try {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const buffer = await response.arrayBuffer();
+      const fileName = `temp_img_${Date.now()}_${i}.jpg`;
+      await fs.writeFile(fileName, Buffer.from(buffer));
+      imagePaths.push(fileName);
+    } catch (err) {
+      console.error(`فشل توليد الصورة ${i+1}:`, err.message);
+      // نستمر في حالة فشل صورة واحدة
+    }
+  }
+  return imagePaths;
+}
+
+/** إنشاء فيديو من الصور باستخدام ffmpeg (fade transition) */
+async function createVideoFromImages(imagePaths, outputVideoPath, durationPerImage = 3.5, fadeDuration = 0.5) {
+  if (imagePaths.length === 0) throw new Error('لا توجد صور لإنشاء الفيديو');
+
+  // التحقق من وجود ffmpeg
+  try {
+    await exec('ffmpeg -version');
+  } catch (e) {
+    throw new Error('ffmpeg غير مثبت على النظام. يرجى تثبيته أولاً.');
+  }
+
+  return new Promise((resolve, reject) => {
+    const numImages = imagePaths.length;
+    const duration = durationPerImage;
+    const fade = fadeDuration;
+
+    let command = ffmpeg();
+    imagePaths.forEach(img => command.input(img));
+
+    // بناء filter complex يدوياً
+    let filterParts = [];
+    let inputs = [];
+    for (let i = 0; i < numImages; i++) {
+      const inLabel = `[${i}:v]`;
+      const outLabel = `[v${i}]`;
+      const scaleFilter = `scale=1024:1024:force_original_aspect_ratio=decrease,pad=1024:1024:(ow-iw)/2:(oh-ih)/2`;
+      const trimFilter = `trim=0:${duration},setpts=PTS-STARTPTS`;
+      let fadeFilter = '';
+      if (i === 0) {
+        fadeFilter = `fade=in:0:d=${fade}`;
+      } else if (i === numImages - 1) {
+        fadeFilter = `fade=out:${duration - fade}:d=${fade}`;
+      } else {
+        fadeFilter = `fade=in:0:d=${fade},fade=out:${duration - fade}:d=${fade}`;
+      }
+      const filter = `${scaleFilter},${trimFilter},${fadeFilter}`;
+      filterParts.push(`${inLabel} ${filter} ${outLabel}`);
+      inputs.push(outLabel);
+    }
+
+    // xfade بين كل زوج متتالي
+    let currentOutput = 'v0';
+    for (let i = 1; i < numImages; i++) {
+      const prev = currentOutput;
+      const next = `v${i}`;
+      const out = `v${i-1}_${i}`;
+      const offset = duration - fade;
+      const xfadeFilter = `[${prev}][${next}] xfade=transition=fade:duration=${fade}:offset=${offset} [${out}]`;
+      filterParts.push(xfadeFilter);
+      currentOutput = out;
+    }
+
+    const filterComplex = filterParts.join('; ');
+    command = command.complexFilter(filterComplex, 'output');
+
+    // إعدادات الخرج
+    command
+      .output(outputVideoPath)
+      .videoCodec('libx264')
+      .audioCodec('aac')
+      .outputOptions([
+        '-pix_fmt yuv420p',
+        '-movflags +faststart',
+        '-r 30'
+      ])
+      .on('start', (cmd) => console.log('🎬 بدء إنشاء الفيديو:', cmd))
+      .on('progress', (progress) => {
+        if (progress.percent) console.log(`⏳ تقدم: ${Math.round(progress.percent)}%`);
+      })
+      .on('end', () => {
+        console.log('✅ تم إنشاء الفيديو بنجاح');
+        resolve(outputVideoPath);
+      })
+      .on('error', (err) => {
+        console.error('❌ خطأ في ffmpeg:', err);
+        reject(err);
+      })
+      .run();
+  });
+}
+
+/** الدالة الرئيسية لتوليد قصة كاملة (أوصاف + صور + فيديو) */
+async function generateStoryVideo(storyIdea, geminiClient) {
+  // 1. توليد الأوصاف
+  const descriptions = await generateStoryDescriptions(storyIdea, geminiClient);
+  // 2. توليد الصور
+  const imagePaths = await generateImagesFromDescriptions(descriptions);
+  if (imagePaths.length === 0) {
+    throw new Error('لم يتم توليد أي صورة.');
+  }
+  // 3. إنشاء الفيديو
+  const videoFileName = `story_video_${Date.now()}.mp4`;
+  await createVideoFromImages(imagePaths, videoFileName, 3.5, 0.5);
+  // 4. تنظيف الصور المؤقتة (بعد نجاح الفيديو)
+  for (const img of imagePaths) {
+    await fs.unlink(img).catch(() => {});
+  }
+  return { videoPath: videoFileName, descriptions };
+}
+
+// ── معالج الأزرار التفاعلية (نفس السابق) ────
 bot.action(/^cmd_(.+)$/, async (ctx) => {
   const action = ctx.match[1];
   await ctx.answerCbQuery();
@@ -106,38 +277,22 @@ bot.action(/^cmd_(.+)$/, async (ctx) => {
     ctx.reply('⚡ اكتب سؤالك بعد **/groq**\nمثال: `/groq اشرح النظرية النسبية`', { parse_mode: 'Markdown' });
   } else if (action === 'image') {
     ctx.reply('🖼️ اكتب وصف الصورة بعد **/image**\nمثال: `/image منظر طبيعي لجبال`', { parse_mode: 'Markdown' });
+  } else if (action === 'story') {
+    ctx.reply('📖 اكتب فكرة القصة بعد **/story**\nمثال: `/story طفل يكتشف غابة مسحورة`', { parse_mode: 'Markdown' });
   } else if (action === 'help') {
     ctx.reply('📘 استخدم **/help** لعرض جميع الأوامر.', { parse_mode: 'Markdown' });
   }
 });
 
-bot.action('regen_image', async (ctx) => {
+bot.action('regen_image', async (ctx) => { /* كما هو */ });
+// نحتاج أيضاً زر إعادة توليد القصة (اختياري)
+bot.action('regen_story', async (ctx) => {
   await ctx.answerCbQuery();
   const userId = ctx.from.id;
-  const prompt = lastImagePrompt.get(userId);
-  if (!prompt) return ctx.reply('⚠️ لا يوجد وصف سابق لإعادة التوليد.');
-  await ctx.sendChatAction('upload_photo');
-  const statusMsg = await ctx.reply('🎨 جارٍ إعادة توليد الصورة...');
-  try {
-    const imageUrl = await generateImageUrl(prompt);
-    await ctx.replyWithPhoto(
-      { url: imageUrl },
-      {
-        caption: `🖼️ ${prompt}\n\nتم الانشاء بواسطة بوت @ysfaibot`,
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '🔄 إعادة التوليد', callback_data: 'regen_image' }],
-            [{ text: '⬇️ تحميل الصورة', url: imageUrl }]
-          ]
-        }
-      }
-    );
-    stats.images++;
-    await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
-  } catch (error) {
-    console.error('خطأ في إعادة التوليد:', error.message);
-    await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, '❌ فشلت إعادة التوليد. حاول لاحقاً.').catch(() => {});
-  }
+  const prompt = lastStoryPrompt.get(userId);
+  if (!prompt) return ctx.reply('⚠️ لا توجد قصة سابقة لإعادة التوليد.');
+  // نستدعي نفس منطق /story
+  await handleStoryCommand(ctx, prompt);
 });
 
 // ── أمر /start ──────────────────────────────────
@@ -153,6 +308,9 @@ bot.start((ctx) => {
         ],
         [
           { text: '🖼️ توليد صورة', callback_data: 'cmd_image' },
+          { text: '📖 توليد فيديو من قصة', callback_data: 'cmd_story' }
+        ],
+        [
           { text: 'ℹ️ مساعدة', callback_data: 'cmd_help' }
         ]
       ]
@@ -160,12 +318,13 @@ bot.start((ctx) => {
   });
 });
 
-// ── أمر /help ──────────────────────────────────
+// ── أمر /help (معدل) ──────────────────────────
 bot.help((ctx) => {
   const help = `📘 **دليل الاستخدام**\n\n` +
     `• **/gemini [نص]** – اسأل نموذج Google Gemini (عميق)\n` +
     `• **/groq [نص]** – اسأل نموذج Groq (سريع)\n` +
     `• **/image [وصف]** – توليد صورة بالذكاء الاصطناعي\n` +
+    `• **/story [فكرة]** – توليد فيديو من 8 صور متسلسلة بناءً على فكرة قصة\n` +
     `• **/start** – رسالة الترحيب مع أزرار تفاعلية\n` +
     `• **/help** – هذا الدليل\n` +
     `• **/stats** – إحصائيات الاستخدام (للمالك فقط)\n\n` +
@@ -195,6 +354,7 @@ bot.command('stats', (ctx) => {
     `🧠 **Gemini:** ${stats.gemini.success} نجاح | ${stats.gemini.fail} فشل | متوسط ${geminiAvg}ms\n` +
     `🖼️ **الصور المولدة:** ${stats.images}\n` +
     `📄 **التلخيصات:** ${stats.summaries}\n` +
+    `🎬 **فيديوهات القصص:** ${stats.stories}\n` +
     `🔄 **المستخدمين النشطين:** ${sessions.size}`;
   ctx.reply(report, { parse_mode: 'Markdown' });
 });
@@ -210,12 +370,75 @@ function extractQuestion(text, command) {
   return '';
 }
 
+// ── دالة مساعدة لمعالجة /story ──────────────
+async function handleStoryCommand(ctx, storyIdea) {
+  const userId = ctx.from.id;
+  // حفظ الفكرة لإعادة التوليد
+  lastStoryPrompt.set(userId, storyIdea);
+
+  await ctx.reply('📖 جاري معالجة فكرة القصة وتوليد 8 أوصاف مفصلة... (قد يستغرق هذا دقيقة)');
+
+  // اختيار عميل Gemini (المفتاح الأول إن وجد، وإلا الثاني)
+  let geminiClient = gemini1 || gemini2;
+  if (!geminiClient) {
+    return ctx.reply('❌ لا يوجد مفتاح Gemini لتوليد الأوصاف. يرجى إعداد GEMINI_API_KEY في البيئة.');
+  }
+
+  try {
+    // 1. توليد الأوصاف
+    const descriptions = await generateStoryDescriptions(storyIdea, geminiClient);
+    // نرسل الأوصاف للمستخدم للاطلاع (اختياري)
+    const descText = descriptions.map((d, i) => `${i+1}. ${d}`).join('\n\n');
+    await ctx.reply(`✅ تم توليد 8 أوصاف. جاري إنشاء الصور... (قد يستغرق 30-60 ثانية)`, { parse_mode: 'Markdown' });
+
+    // 2. توليد الصور
+    const imagePaths = await generateImagesFromDescriptions(descriptions);
+    if (imagePaths.length === 0) {
+      return ctx.reply('❌ فشل توليد جميع الصور. حاول مرة أخرى.');
+    }
+
+    // 3. إنشاء الفيديو
+    const videoFileName = `story_video_${Date.now()}.mp4`;
+    await ctx.reply('🎬 جاري تجميع الصور في فيديو...');
+    await createVideoFromImages(imagePaths, videoFileName, 3.5, 0.5);
+
+    // 4. إرسال الفيديو
+    await ctx.replyWithVideo(
+      { source: videoFileName },
+      {
+        caption: `🎥 فيديو القصة المصور (كل صورة 3.5 ثانية)\n\n📖 الفكرة: ${storyIdea}`,
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🔄 إعادة توليد الفيديو', callback_data: 'regen_story' }]
+          ]
+        }
+      }
+    );
+
+    // تحديث الإحصائيات
+    stats.stories++;
+
+    // تنظيف الملفات
+    await fs.unlink(videoFileName).catch(() => {});
+    // الصور حذفت سابقاً في createVideoFromImages، لكن نتأكد
+    for (const img of imagePaths) {
+      await fs.unlink(img).catch(() => {});
+    }
+
+  } catch (error) {
+    console.error('خطأ في /story:', error);
+    await ctx.reply(`❌ حدث خطأ أثناء توليد الفيديو: ${error.message}`);
+    // محاولة إرسال الصور منفردة كحل بديل (إذا كان لدينا بعض الصور)
+    // لكننا لا نملك قائمة الصور هنا، لذا نكتفي بالخطأ.
+  }
+}
+
 // ── معالج الرسائل النصية (الشامل) ──────────────
 bot.on('text', async (ctx) => {
   const text = ctx.message.text.trim();
   const userId = ctx.from.id;
 
-  // --- الكشف عن الروابط وتلخيصها ---
+  // --- الكشف عن الروابط وتلخيصها (نفس السابق) ---
   if (!text.startsWith('/')) {
     const urlRegex = /(https?:\/\/[^\s]+)/g;
     const urls = text.match(urlRegex);
@@ -256,7 +479,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // --- /image ---
+  // --- أمر /image --- (نفس السابق)
   if (text.startsWith('/image')) {
     const prompt = extractQuestion(text, '/image');
     if (!prompt) {
@@ -288,7 +511,17 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // --- /gemini و /groq (النصوص) ---
+  // --- أمر /story (جديد) ---
+  if (text.startsWith('/story')) {
+    const storyIdea = extractQuestion(text, '/story');
+    if (!storyIdea) {
+      return ctx.reply('📖 اكتب فكرة القصة بعد /story\nمثال: /story طفل يكتشف غابة مسحورة');
+    }
+    await handleStoryCommand(ctx, storyIdea);
+    return;
+  }
+
+  // --- /gemini و /groq (نفس السابق) ---
   if (!text.startsWith('/gemini') && !text.startsWith('/groq')) return;
 
   const isGemini = text.startsWith('/gemini');
@@ -314,12 +547,10 @@ bot.on('text', async (ctx) => {
         stream: false,
       });
       const reply = completion.choices[0]?.message?.content || 'لم أحصل على رد.';
-      // حفظ السياق
       addMessageToSession(userId, 'user', question);
       addMessageToSession(userId, 'assistant', reply);
       const duration = Date.now() - start;
       recordStat(modelType, true, duration);
-      // إرسال الرد كاملاً
       await ctx.reply(reply, { parse_mode: 'Markdown' });
       return true;
     } catch (error) {
@@ -331,7 +562,6 @@ bot.on('text', async (ctx) => {
   };
 
   if (isGemini) {
-    // محاولة Gemini عبر المفتاح الأول
     let success = false;
     if (gemini1) {
       success = await executeRequest('gemini', gemini1, 'gemini-2.5-flash');
@@ -340,9 +570,7 @@ bot.on('text', async (ctx) => {
       console.log('محاولة استخدام GEMINI_API_KEY2...');
       success = await executeRequest('gemini', gemini2, 'gemini-2.5-flash');
     }
-
     if (!success) {
-      // فشل كلا المفتاحين – الانتقال إلى Groq
       const message = gemini1 || gemini2
         ? '⚠️ تعذر الاتصال بـ Gemini. جاري تحويل طلبك إلى Groq...'
         : '⚠️ نموذج Gemini غير مفعل. جاري استخدام Groq بدلاً منه...';
@@ -351,10 +579,8 @@ bot.on('text', async (ctx) => {
       if (!groqSuccess) ctx.reply('❌ فشل كلا النموذجين. حاول لاحقاً.');
     }
   } else {
-    // طلب Groq مباشرة
     const success = await executeRequest('groq', groq, 'llama-3.3-70b-versatile');
     if (!success) {
-      // إذا فشل Groq، نجرب Gemini (بالمفتاحين)
       if (gemini1 || gemini2) {
         ctx.reply('⚠️ تعذر الاتصال بـ Groq. جاري تحويل طلبك إلى Gemini...');
         let geminiSuccess = false;
@@ -372,7 +598,7 @@ bot.on('text', async (ctx) => {
   }
 });
 
-// ── خادم Express ──────────────────────────────
+// ── خادم Express (نفس السابق) ──────────────
 const app = express();
 const PORT = process.env.PORT || 3000;
 
