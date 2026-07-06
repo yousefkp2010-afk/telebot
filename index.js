@@ -12,12 +12,11 @@ const exec = promisify(require('child_process').exec);
 const ffmpeg = require('fluent-ffmpeg');
 
 // ── إعدادات البيئة ────────────────────────────────────
-console.log('🚀 بدء تشغيل البوت...');
+console.log('🚀 بدء تشغيل البوت (Polling mode)...');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
 const PORT = process.env.PORT || 3000;
-const APP_URL = process.env.APP_URL || `https://${process.env.RENDER_EXTERNAL_HOSTNAME || 'localhost'}`;
 
 if (!BOT_TOKEN) {
   console.error('❌ BOT_TOKEN غير موجود في المتغيرات البيئية!');
@@ -114,8 +113,7 @@ const lastStoryPrompt = new Map();
 // ── دالة توليد رابط الصورة ──────────────────────────
 async function generateImageUrl(prompt) {
   const encoded = encodeURIComponent(prompt);
-  const url = `https://image.pollinations.ai/prompt/${encoded}?model=flux&width=1024&height=1024&nologo=true`;
-  return url;
+  return `https://image.pollinations.ai/prompt/${encoded}?model=flux&width=1024&height=1024&nologo=true`;
 }
 
 // ── استخراج النص من رابط ──────────────────────────────
@@ -132,12 +130,7 @@ async function extractTextFromUrl(url) {
   }
 }
 
-// ── دوال توليد القصة (معدلة) ───────────────────────────
-
-/**
- * توليد 8 أوصاف باللغة الإنجليزية بصيغة JSON باستخدام Gemini
- * مع إعادة محاولة تلقائية
- */
+// ── دوال توليد القصة (نفس السابق) ──────────────────
 async function generateStoryDescriptions(storyIdea, geminiClient, retryCount = 0) {
   console.log(`📝 توليد أوصاف القصة (محاولة ${retryCount + 1})...`);
   const prompt = `
@@ -181,9 +174,6 @@ Output format: ["description 1", "description 2", ..., "description 8"]
   }
 }
 
-/**
- * توليد صورة واحدة مع إعادة محاولة عند 429
- */
 async function generateSingleImageWithRetry(prompt, index, maxRetries = 3) {
   const url = await generateImageUrl(prompt);
   let lastError = null;
@@ -205,7 +195,7 @@ async function generateSingleImageWithRetry(prompt, index, maxRetries = 3) {
       if (response.status === 429) {
         console.warn(`⚠️ 429 (معدل الطلبات) للصورة ${index+1}. انتظار أطول...`);
         await new Promise(r => setTimeout(r, 15000));
-        continue; // أعد المحاولة
+        continue;
       }
 
       if (!response.ok) {
@@ -230,26 +220,18 @@ async function generateSingleImageWithRetry(prompt, index, maxRetries = 3) {
   throw new Error(`فشل توليد الصورة ${index+1} بعد ${maxRetries} محاولات: ${lastError?.message || 'غير معروف'}`);
 }
 
-/**
- * توليد جميع الصور وإرسالها فوراً للمستخدم (واحدة تلو الأخرى)
- * يعيد مصفوفة من أسماء الملفات للصور التي تم توليدها بنجاح
- */
 async function generateAndSendImages(descriptions, ctx) {
   const imagePaths = [];
   const total = descriptions.length;
   
-  // نرسل رسالة بداية
   await ctx.reply(`🖼️ سيتم توليد ${total} صور وإرسالها فوراً (قد يستغرق كل صورة 10-15 ثانية)...`);
 
   for (let i = 0; i < descriptions.length; i++) {
     try {
-      // نرسل للمستخدم أننا بدأنا توليد الصورة
       await ctx.reply(`⏳ جاري توليد الصورة ${i+1}/${total}...`);
-      
       const fileName = await generateSingleImageWithRetry(descriptions[i], i, 3);
       if (fileName) {
         imagePaths.push(fileName);
-        // إرسال الصورة للمستخدم فوراً
         await ctx.replyWithPhoto(
           { source: fileName },
           { caption: `📸 الصورة ${i+1}/${total}` }
@@ -267,10 +249,6 @@ async function generateAndSendImages(descriptions, ctx) {
   return imagePaths;
 }
 
-/**
- * إنشاء فيديو من الصور باستخدام ffmpeg (مع انتقال fade)
- * مع التحقق المسبق من وجود ffmpeg ومعالجة الأخطاء
- */
 async function createVideoFromImages(imagePaths, outputVideoPath, durationPerImage = 3.5, fadeDuration = 0.5) {
   console.log(`🎬 بدء إنشاء فيديو من ${imagePaths.length} صور...`);
   
@@ -278,7 +256,6 @@ async function createVideoFromImages(imagePaths, outputVideoPath, durationPerIma
     throw new Error('لا توجد صور لإنشاء الفيديو.');
   }
 
-  // التحقق من وجود ffmpeg
   try {
     await exec('ffmpeg -version');
   } catch (e) {
@@ -293,7 +270,6 @@ async function createVideoFromImages(imagePaths, outputVideoPath, durationPerIma
     let command = ffmpeg();
     imagePaths.forEach(img => command.input(img));
 
-    // بناء filter complex
     let filterParts = [];
     for (let i = 0; i < numImages; i++) {
       const inLabel = `[${i}:v]`;
@@ -312,7 +288,6 @@ async function createVideoFromImages(imagePaths, outputVideoPath, durationPerIma
       filterParts.push(`${inLabel} ${filter} ${outLabel}`);
     }
 
-    // xfade بين كل زوج متتالي
     let currentOutput = 'v0';
     for (let i = 1; i < numImages; i++) {
       const prev = currentOutput;
@@ -352,10 +327,6 @@ async function createVideoFromImages(imagePaths, outputVideoPath, durationPerIma
   });
 }
 
-/**
- * الدالة الرئيسية لمعالجة /story (معدلة)
- * ترسل الصور فوراً، ثم تحاول إنشاء فيديو وإرساله
- */
 async function handleStoryCommand(ctx, storyIdea) {
   const userId = ctx.from.id;
   const startTime = Date.now();
@@ -363,24 +334,20 @@ async function handleStoryCommand(ctx, storyIdea) {
 
   lastStoryPrompt.set(userId, storyIdea);
   
-  // رسالة فورية لتجنب انتهاء المهلة
   await ctx.reply('📖 جاري معالجة فكرة القصة وتوليد 8 أوصاف مفصلة... (قد يستغرق هذا دقيقة)');
 
-  // اختيار عميل Gemini
   let geminiClient = gemini1 || gemini2;
   if (!geminiClient) {
     return ctx.reply('❌ لا يوجد مفتاح Gemini لتوليد الأوصاف. يرجى إعداد GEMINI_API_KEY في البيئة.');
   }
 
   try {
-    // 1. توليد الأوصاف
     console.log('📝 المرحلة 1: توليد الأوصاف...');
     const descriptions = await generateStoryDescriptions(storyIdea, geminiClient);
     console.log(`✅ تم توليد ${descriptions.length} وصفاً.`);
 
     await ctx.reply('✅ تم توليد 8 أوصاف. سيتم الآن توليد الصور وإرسالها واحدة تلو الأخرى...');
 
-    // 2. توليد الصور وإرسالها فوراً
     console.log('🖼️ المرحلة 2: توليد الصور وإرسالها...');
     const imagePaths = await generateAndSendImages(descriptions, ctx);
     
@@ -391,10 +358,8 @@ async function handleStoryCommand(ctx, storyIdea) {
 
     console.log(`✅ تم إرسال ${imagePaths.length} صور للمستخدم.`);
 
-    // 3. محاولة إنشاء فيديو (إذا كان لدينا على الأقل صورتين)
     if (imagePaths.length < 2) {
       await ctx.reply('⚠️ عدد الصور أقل من 2، لا يمكن إنشاء فيديو.');
-      // ننظف الصور
       for (const img of imagePaths) {
         await fs.unlink(img).catch(() => {});
       }
@@ -416,7 +381,6 @@ async function handleStoryCommand(ctx, storyIdea) {
       await ctx.reply(`⚠️ تعذر إنشاء الفيديو: ${videoError.message}`);
     }
 
-    // 4. إذا تم إنشاء الفيديو، نرسله
     if (videoCreated && videoFileName) {
       try {
         await ctx.replyWithVideo(
@@ -432,7 +396,6 @@ async function handleStoryCommand(ctx, storyIdea) {
         );
         console.log(`✅ تم إرسال الفيديو.`);
         stats.stories++;
-        // حذف الفيديو بعد الإرسال
         await fs.unlink(videoFileName).catch(() => {});
       } catch (sendError) {
         console.error(`❌ فشل إرسال الفيديو:`, sendError.message);
@@ -440,7 +403,6 @@ async function handleStoryCommand(ctx, storyIdea) {
       }
     }
 
-    // تنظيف الصور المؤقتة
     console.log(`🧹 تنظيف ${imagePaths.length} صورة مؤقتة...`);
     for (const img of imagePaths) {
       await fs.unlink(img).catch((err) => {
@@ -457,10 +419,6 @@ async function handleStoryCommand(ctx, storyIdea) {
     await ctx.reply(`❌ حدث خطأ أثناء توليد الفيديو: ${error.message}`);
   }
 }
-
-// ── باقي الكود (بدون تغيير) ──────────────────────────
-// ... (نفس الكود السابق للأزرار والأوامر والخادم) ...
-// لكنني سأكتبه كاملاً لضمان عدم وجود أخطاء.
 
 // ── إنشاء البوت ──────────────────────────────────────
 const bot = new Telegraf(BOT_TOKEN);
@@ -753,48 +711,37 @@ bot.on('text', async (ctx) => {
   }
 });
 
-// ── خادم Express ──────────────────────────────────────
+// ── خادم Express (فقط للـ Health Check و Guard) ──────
 const app = express();
 app.use(express.json());
 
-app.get('/', (_, res) => res.send('Bot is alive'));
+app.get('/', (_, res) => res.send('Bot is alive (Polling mode)'));
 
-app.post('/webhook', (req, res) => {
-  bot.handleUpdate(req.body, res);
-});
-
-app.get('/setwebhook', async (req, res) => {
+// ── تشغيل البوت باستخدام Polling ─────────────────────
+(async () => {
   try {
-    const webhookUrl = `${APP_URL}/webhook`;
-    const result = await bot.telegram.setWebhook(webhookUrl);
-    res.send(`✅ تم تعيين الـ webhook إلى ${webhookUrl}\nالنتيجة: ${JSON.stringify(result)}`);
-  } catch (error) {
-    res.status(500).send(`❌ فشل تعيين الـ webhook: ${error.message}`);
-  }
-});
-
-app.get('/test-telegram', async (_, res) => {
-  try {
-    const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getMe`);
-    const data = await response.json();
-    res.send(`✅ نجح الاتصال: ${JSON.stringify(data)}`);
+    // إلغاء أي Webhook نشط لتجنب التعارض
+    await bot.telegram.deleteWebhook();
+    console.log('✅ تم إلغاء Webhook (إن وجد).');
   } catch (e) {
-    res.status(500).send(`❌ فشل الاتصال: ${e.message}`);
+    console.warn('⚠️ فشل إلغاء Webhook:', e.message);
   }
-});
 
-app.listen(PORT, async () => {
-  console.log(`🚀 Express يعمل على المنفذ ${PORT}`);
-  console.log(`🌐 عنوان التطبيق: ${APP_URL}`);
+  // بدء Polling
+  bot.launch()
+    .then(() => {
+      console.log('✅ البوت يعمل الآن باستخدام Polling (getUpdates).');
+      console.log('🤖 جاهز لاستقبال الأوامر.');
+    })
+    .catch((err) => {
+      console.error('❌ فشل تشغيل البوت:', err);
+      process.exit(1);
+    });
+})();
 
-  try {
-    const webhookUrl = `${APP_URL}/webhook`;
-    const result = await bot.telegram.setWebhook(webhookUrl);
-    console.log(`✅ تم تعيين الـ webhook إلى ${webhookUrl}`);
-    console.log(`📩 الرد: ${JSON.stringify(result)}`);
-  } catch (error) {
-    console.error(`❌ فشل تعيين الـ webhook تلقائياً:`, error.message);
-  }
+// ── خادم Express ──────────────────────────────────────
+app.listen(PORT, () => {
+  console.log(`🚀 Express يعمل على المنفذ ${PORT} (للـ Health Check فقط)`);
 });
 
 // ── الحارس المتبادل ────────────────────────────────────
@@ -809,16 +756,15 @@ if (GUARD_URL) {
   ping();
 }
 
-process.once('SIGINT', async () => {
+// ── معالجة الإغلاق ──────────────────────────────────
+process.once('SIGINT', () => {
   console.log('🛑 إيقاف البوت...');
-  await bot.telegram.deleteWebhook().catch(() => {});
+  bot.stop('SIGINT');
   process.exit(0);
 });
 
-process.once('SIGTERM', async () => {
+process.once('SIGTERM', () => {
   console.log('🛑 إيقاف البوت...');
-  await bot.telegram.deleteWebhook().catch(() => {});
+  bot.stop('SIGTERM');
   process.exit(0);
 });
-
-console.log('✅ اكتمل إعداد البوت، في انتظار التحديثات...');
