@@ -130,7 +130,12 @@ async function extractTextFromUrl(url) {
   }
 }
 
-// ── دوال توليد القصة (نفس السابق) ──────────────────
+// ── دوال توليد القصة ──────────────────────────────────
+
+/**
+ * توليد 8 أوصاف باللغة الإنجليزية بصيغة JSON باستخدام Gemini
+ * مع إعادة محاولة تلقائية
+ */
 async function generateStoryDescriptions(storyIdea, geminiClient, retryCount = 0) {
   console.log(`📝 توليد أوصاف القصة (محاولة ${retryCount + 1})...`);
   const prompt = `
@@ -174,7 +179,58 @@ Output format: ["description 1", "description 2", ..., "description 8"]
   }
 }
 
-async function generateSingleImageWithRetry(prompt, index, maxRetries = 3) {
+/**
+ * دالة مساعدة لإرسال رسالة عد تنازلي محدثة
+ * ترسل رسالة جديدة وتقوم بتحديثها كل 5 ثوانٍ حتى تصل إلى 0
+ */
+async function sendCountdown(ctx, imageNumber, total, initialSeconds = 30) {
+  let seconds = initialSeconds;
+  let message = await ctx.reply(
+    `⏳ سيتم إنشاء الصورة ${imageNumber}/${total} خلال ${seconds} ثانية...`
+  );
+
+  const interval = setInterval(async () => {
+    seconds -= 5;
+    if (seconds <= 0) {
+      clearInterval(interval);
+      try {
+        await ctx.telegram.editMessageText(
+          ctx.chat.id,
+          message.message_id,
+          undefined,
+          `🖼️ جارٍ إنشاء الصورة ${imageNumber}/${total} الآن...`
+        );
+      } catch (e) {}
+      return;
+    }
+    try {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        message.message_id,
+        undefined,
+        `⏳ سيتم إنشاء الصورة ${imageNumber}/${total} خلال ${seconds} ثانية...`
+      );
+    } catch (e) {}
+  }, 5000);
+
+  // ننتظر حتى انتهاء العد التنازلي
+  await new Promise(resolve => {
+    const checkDone = setInterval(() => {
+      if (seconds <= 0) {
+        clearInterval(checkDone);
+        resolve();
+      }
+    }, 1000);
+  });
+
+  return message;
+}
+
+/**
+ * توليد صورة واحدة مع إعادة محاولة عند 429 أو أي خطأ
+ * مع مهلة قصوى 30 ثانية لكل طلب
+ */
+async function generateSingleImageWithRetry(prompt, index, ctx, total, maxRetries = 3) {
   const url = await generateImageUrl(prompt);
   let lastError = null;
   
@@ -182,19 +238,38 @@ async function generateSingleImageWithRetry(prompt, index, maxRetries = 3) {
     try {
       console.log(`🖼️ محاولة ${attempt} للصورة ${index+1}...`);
       
-      // تأخير عشوائي بين 7-12 ثانية لتجنب 429
-      const delay = 7000 + Math.random() * 5000;
-      console.log(`⏳ انتظار ${Math.round(delay/1000)} ثوانٍ قبل الطلب...`);
-      await new Promise(r => setTimeout(r, delay));
+      // إرسال عد تنازلي قبل كل محاولة (باستثناء المحاولة الأولى التي سبق أن أرسلنا لها عداً)
+      if (attempt > 1) {
+        await ctx.reply(`🔄 إعادة محاولة الصورة ${index+1} (محاولة ${attempt})...`);
+      }
 
+      // تأخير عشوائي بين 8-15 ثانية (يتم عرضه عبر العد التنازلي)
+      const delay = 8000 + Math.random() * 7000;
+      console.log(`⏳ انتظار ${Math.round(delay/1000)} ثوانٍ قبل الطلب...`);
+      
+      // نستخدم العد التنازلي لإعلام المستخدم
+      await sendCountdown(ctx, index+1, total, Math.ceil(delay / 1000));
+
+      console.log(`📡 إرسال طلب إلى Pollinations للصورة ${index+1}...`);
+      
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 45000);
-      const response = await fetch(url, { signal: controller.signal });
-      clearTimeout(timeout);
+      const timeoutId = setTimeout(() => {
+        console.warn(`⏰ انتهت مهلة 30 ثانية للصورة ${index+1}. إلغاء الطلب...`);
+        controller.abort();
+      }, 30000);
+
+      const response = await fetch(url, { 
+        signal: controller.signal,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+      });
+      clearTimeout(timeoutId);
 
       if (response.status === 429) {
-        console.warn(`⚠️ 429 (معدل الطلبات) للصورة ${index+1}. انتظار أطول...`);
-        await new Promise(r => setTimeout(r, 15000));
+        console.warn(`⚠️ 429 (معدل الطلبات) للصورة ${index+1}. انتظار 20 ثانية...`);
+        await ctx.reply(`⚠️ تجاوزت حد الطلبات، انتظر 20 ثانية قبل المحاولة مرة أخرى...`);
+        await new Promise(r => setTimeout(r, 20000));
         continue;
       }
 
@@ -207,31 +282,51 @@ async function generateSingleImageWithRetry(prompt, index, maxRetries = 3) {
       await fs.writeFile(fileName, Buffer.from(buffer));
       console.log(`✅ تم حفظ الصورة ${index+1} في ${fileName}`);
       return fileName;
+      
     } catch (err) {
-      lastError = err;
-      console.error(`❌ فشل توليد الصورة ${index+1} (محاولة ${attempt}):`, err.message);
+      if (err.name === 'AbortError') {
+        console.warn(`⏰ تم إلغاء طلب الصورة ${index+1} بسبب انتهاء المهلة.`);
+        lastError = new Error('انتهت مهلة الطلب');
+        await ctx.reply(`⏰ انتهت مهلة الطلب للصورة ${index+1}. جاري إعادة المحاولة...`);
+      } else {
+        lastError = err;
+        console.error(`❌ فشل توليد الصورة ${index+1} (محاولة ${attempt}):`, err.message);
+        await ctx.reply(`❌ فشلت محاولة ${attempt} للصورة ${index+1}: ${err.message}`);
+      }
+      
       if (attempt < maxRetries) {
-        const wait = 10000 * attempt;
+        const wait = 15000 * attempt;
         console.log(`⏳ انتظار ${wait/1000} ثوانٍ قبل المحاولة التالية...`);
+        await ctx.reply(`⏳ انتظار ${wait/1000} ثوانٍ قبل المحاولة التالية...`);
         await new Promise(r => setTimeout(r, wait));
       }
     }
   }
+  
   throw new Error(`فشل توليد الصورة ${index+1} بعد ${maxRetries} محاولات: ${lastError?.message || 'غير معروف'}`);
 }
 
+/**
+ * توليد جميع الصور وإرسالها فوراً للمستخدم
+ * مع استمرار العملية حتى لو فشلت بعض الصور
+ */
 async function generateAndSendImages(descriptions, ctx) {
   const imagePaths = [];
   const total = descriptions.length;
+  const failedImages = [];
   
-  await ctx.reply(`🖼️ سيتم توليد ${total} صور وإرسالها فوراً (قد يستغرق كل صورة 10-15 ثانية)...`);
+  await ctx.reply(`🖼️ سيتم توليد ${total} صور وإرسالها فوراً (سيظهر عد تنازلي قبل كل صورة)...`);
 
   for (let i = 0; i < descriptions.length; i++) {
     try {
-      await ctx.reply(`⏳ جاري توليد الصورة ${i+1}/${total}...`);
-      const fileName = await generateSingleImageWithRetry(descriptions[i], i, 3);
+      // إعلام المستخدم ببدء التحضير للصورة
+      await ctx.reply(`🔄 جاري التحضير للصورة ${i+1}/${total}...`);
+      
+      const fileName = await generateSingleImageWithRetry(descriptions[i], i, ctx, total, 3);
+      
       if (fileName) {
         imagePaths.push(fileName);
+        // إرسال الصورة
         await ctx.replyWithPhoto(
           { source: fileName },
           { caption: `📸 الصورة ${i+1}/${total}` }
@@ -240,15 +335,25 @@ async function generateAndSendImages(descriptions, ctx) {
         stats.images++;
       }
     } catch (err) {
-      console.error(`❌ فشل توليد وإرسال الصورة ${i+1}:`, err.message);
-      await ctx.reply(`⚠️ فشلت الصورة ${i+1}: ${err.message}`);
+      console.error(`❌ فشل نهائي للصورة ${i+1}:`, err.message);
+      failedImages.push(i + 1);
+      await ctx.reply(`⚠️ فشلت الصورة ${i+1} بعد عدة محاولات: ${err.message}`);
+      console.log(`🔄 متابعة مع الصورة التالية...`);
     }
   }
   
-  console.log(`✅ تم توليد وإرسال ${imagePaths.length} من ${total} صور.`);
+  console.log(`📊 ملخص: تم توليد وإرسال ${imagePaths.length} من ${total} صور.`);
+  if (failedImages.length > 0) {
+    console.log(`❌ الصور الفاشلة: ${failedImages.join(', ')}`);
+    await ctx.reply(`⚠️ فشلت ${failedImages.length} صور: ${failedImages.join(', ')}`);
+  }
+  
   return imagePaths;
 }
 
+/**
+ * إنشاء فيديو من الصور باستخدام ffmpeg (مع انتقال fade)
+ */
 async function createVideoFromImages(imagePaths, outputVideoPath, durationPerImage = 3.5, fadeDuration = 0.5) {
   console.log(`🎬 بدء إنشاء فيديو من ${imagePaths.length} صور...`);
   
@@ -327,6 +432,9 @@ async function createVideoFromImages(imagePaths, outputVideoPath, durationPerIma
   });
 }
 
+/**
+ * الدالة الرئيسية لمعالجة /story
+ */
 async function handleStoryCommand(ctx, storyIdea) {
   const userId = ctx.from.id;
   const startTime = Date.now();
@@ -720,14 +828,12 @@ app.get('/', (_, res) => res.send('Bot is alive (Polling mode)'));
 // ── تشغيل البوت باستخدام Polling ─────────────────────
 (async () => {
   try {
-    // إلغاء أي Webhook نشط لتجنب التعارض
     await bot.telegram.deleteWebhook();
     console.log('✅ تم إلغاء Webhook (إن وجد).');
   } catch (e) {
     console.warn('⚠️ فشل إلغاء Webhook:', e.message);
   }
 
-  // بدء Polling
   bot.launch()
     .then(() => {
       console.log('✅ البوت يعمل الآن باستخدام Polling (getUpdates).');
@@ -739,7 +845,6 @@ app.get('/', (_, res) => res.send('Bot is alive (Polling mode)'));
     });
 })();
 
-// ── خادم Express ──────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`🚀 Express يعمل على المنفذ ${PORT} (للـ Health Check فقط)`);
 });
@@ -756,7 +861,6 @@ if (GUARD_URL) {
   ping();
 }
 
-// ── معالجة الإغلاق ──────────────────────────────────
 process.once('SIGINT', () => {
   console.log('🛑 إيقاف البوت...');
   bot.stop('SIGINT');
