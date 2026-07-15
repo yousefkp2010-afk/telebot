@@ -8,7 +8,6 @@ const cheerio = require('cheerio');
 const fs = require('fs').promises;
 const { promisify } = require('util');
 const exec = promisify(require('child_process').exec);
-const ffmpeg = require('fluent-ffmpeg');
 
 // ── إعدادات البيئة ────────────────────────────────────
 console.log('🚀 بدء تشغيل البوت...');
@@ -44,16 +43,6 @@ if (process.env.GEMINI_API_KEY2) {
   });
   console.log('✅ Gemini (مفتاح 2) جاهز.');
 }
-
-// ── التحقق من ffmpeg ──────────────────────────────────
-(async () => {
-  try {
-    await exec('ffmpeg -version');
-    console.log('✅ ffmpeg مثبت.');
-  } catch (e) {
-    console.error('❌ ffmpeg غير موجود! سيتم تعطيل ميزة الفيديو.');
-  }
-})();
 
 // ── ذاكرة المحادثة ────────────────────────────────────
 const sessions = new Map();
@@ -119,7 +108,7 @@ async function extractTextFromUrl(url) {
   }
 }
 
-// ── توليد أوصاف القصة (مع إعادة محاولة) ─────────────
+// ── توليد أوصاف القصة ──────────────────────────────
 async function generateStoryDescriptions(storyIdea, geminiClient, retryCount = 0) {
   const prompt = `
 You are an expert at generating detailed image descriptions for a story.
@@ -155,6 +144,48 @@ Output format: ["description 1", "description 2", ..., "description 8"]
       return generateStoryDescriptions(storyIdea, geminiClient, retryCount + 1);
     }
     throw error;
+  }
+}
+
+// ── توليد تعليق نصي للقصة (ملخص أو نهاية) ──────────
+async function generateStoryComment(storyIdea, client = null) {
+  // نحاول استخدام Gemini إن وجد، وإلا Groq
+  const prompt = `
+بناءً على فكرة القصة التالية، اكتب تعليقاً ختامياً جميلاً باللغة العربية (لا يزيد عن 200 حرف) يعبر عن مغزى القصة أو نهايتها بأسلوب أدبي بسيط.
+
+فكرة القصة: "${storyIdea}"
+`;
+  try {
+    let completion;
+    if (client) {
+      // استخدام Gemini
+      completion = await client.chat.completions.create({
+        model: 'gemini-2.5-flash',
+        messages: [
+          { role: 'system', content: 'أنت كاتب محترف، اكتب تعليقاً ختامياً قصيراً وجميلاً.' },
+          { role: 'user', content: prompt }
+        ],
+        temperature: 0.7,
+        stream: false,
+      });
+    } else {
+      // استخدام Groq
+      completion = await groq.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
+        messages: [
+          { role: 'system', content: 'أنت كاتب محترف، اكتب تعليقاً ختامياً قصيراً وجميلاً.' },
+          { role: 'user', content: prompt }
+        ],
+        temperature: 0.7,
+        stream: false,
+      });
+    }
+    const comment = completion.choices[0]?.message?.content || '💫 نهاية القصة تحمل في طياتها الكثير من المعاني.';
+    // تقليم النص إلى 200 حرف
+    return comment.length > 200 ? comment.substring(0, 200) + '...' : comment;
+  } catch (error) {
+    console.error('❌ فشل توليد التعليق النصي:', error.message);
+    return '💫 انتهت القصة، وتبقى الذكريات.';
   }
 }
 
@@ -212,61 +243,73 @@ async function generateImagesFromDescriptions(descriptions, ctx) {
   return imagePaths;
 }
 
-// ── إنشاء فيديو من الصور ──────────────────────────────
+// ── إنشاء فيديو من الصور (باستخدام exec مباشرة) ──
 async function createVideoFromImages(imagePaths, outputVideoPath, durationPerImage = 3.5, fadeDuration = 0.5) {
   if (imagePaths.length < 2) throw new Error('يلزم على الأقل صورتان لتكوين فيديو.');
-  try { await exec('ffmpeg -version'); } catch (e) { throw new Error('ffmpeg غير مثبت.'); }
 
-  return new Promise((resolve, reject) => {
-    const numImages = imagePaths.length;
-    const duration = durationPerImage;
-    const fade = fadeDuration;
-    let command = ffmpeg();
-    imagePaths.forEach(img => command.input(img));
+  // التحقق من وجود ffmpeg
+  try {
+    await exec('ffmpeg -version');
+  } catch (e) {
+    throw new Error('ffmpeg غير مثبت على النظام.');
+  }
 
-    let filterParts = [];
-    let inputs = [];
-    for (let i = 0; i < numImages; i++) {
-      const inLabel = `[${i}:v]`;
-      const outLabel = `[v${i}]`;
-      const scaleFilter = `scale=1024:1024:force_original_aspect_ratio=decrease,pad=1024:1024:(ow-iw)/2:(oh-ih)/2`;
-      const trimFilter = `trim=0:${duration},setpts=PTS-STARTPTS`;
-      let fadeFilter = '';
-      if (i === 0) fadeFilter = `fade=in:0:d=${fade}`;
-      else if (i === numImages - 1) fadeFilter = `fade=out:${duration - fade}:d=${fade}`;
-      else fadeFilter = `fade=in:0:d=${fade},fade=out:${duration - fade}:d=${fade}`;
-      const filter = `${scaleFilter},${trimFilter},${fadeFilter}`;
-      filterParts.push(`${inLabel} ${filter} ${outLabel}`);
-      inputs.push(outLabel);
+  const numImages = imagePaths.length;
+  const duration = durationPerImage;
+  const fade = fadeDuration;
+
+  // بناء أجزاء الفلتر لكل صورة
+  let filterParts = [];
+  for (let i = 0; i < numImages; i++) {
+    const inLabel = `[${i}:v]`;
+    const outLabel = `[v${i}]`;
+    const scaleFilter = `scale=1024:1024:force_original_aspect_ratio=decrease,pad=1024:1024:(ow-iw)/2:(oh-ih)/2`;
+    const trimFilter = `trim=0:${duration},setpts=PTS-STARTPTS`;
+    let fadeFilter = '';
+    if (i === 0) {
+      fadeFilter = `fade=in:0:d=${fade}`;
+    } else if (i === numImages - 1) {
+      fadeFilter = `fade=out:${duration - fade}:d=${fade}`;
+    } else {
+      fadeFilter = `fade=in:0:d=${fade},fade=out:${duration - fade}:d=${fade}`;
     }
+    const filter = `${scaleFilter},${trimFilter},${fadeFilter}`;
+    filterParts.push(`${inLabel} ${filter} ${outLabel}`);
+  }
 
-    let currentOutput = 'v0';
-    for (let i = 1; i < numImages; i++) {
-      const prev = currentOutput;
-      const next = `v${i}`;
-      const out = `v${i-1}_${i}`;
-      const offset = duration - fade;
-      const xfadeFilter = `[${prev}][${next}] xfade=transition=fade:duration=${fade}:offset=${offset} [${out}]`;
-      filterParts.push(xfadeFilter);
-      currentOutput = out;
-    }
+  // إضافة انتقالات xfade بين الصور المتتالية
+  let currentOutput = 'v0';
+  for (let i = 1; i < numImages; i++) {
+    const prev = currentOutput;
+    const next = `v${i}`;
+    const out = `v${i-1}_${i}`;
+    const offset = duration - fade;
+    const xfadeFilter = `[${prev}][${next}] xfade=transition=fade:duration=${fade}:offset=${offset} [${out}]`;
+    filterParts.push(xfadeFilter);
+    currentOutput = out;
+  }
 
-    const filterComplex = filterParts.join('; ');
-    command = command.complexFilter(filterComplex, 'output');
-    command
-      .output(outputVideoPath)
-      .videoCodec('libx264')
-      .audioCodec('aac')
-      .outputOptions(['-pix_fmt yuv420p', '-movflags +faststart', '-r 30'])
-      .on('start', (cmd) => console.log(`🎬 ffmpeg بدأ: ${cmd}`))
-      .on('progress', (p) => { if (p.percent) console.log(`⏳ تقدم الفيديو: ${Math.round(p.percent)}%`); })
-      .on('end', () => { console.log(`✅ فيديو تم إنشاؤه: ${outputVideoPath}`); resolve(outputVideoPath); })
-      .on('error', (err) => { console.error('❌ خطأ ffmpeg:', err.message); reject(err); })
-      .run();
-  });
+  // الفلتر النهائي (جميع الأجزاء مفصولة بفواصل منقوطة)
+  const filterComplex = filterParts.join('; ');
+
+  // بناء أمر ffmpeg
+  const inputArgs = imagePaths.map(p => `-i "${p}"`).join(' ');
+  const cmd = `ffmpeg ${inputArgs} -filter_complex "${filterComplex}" -map "[${currentOutput}]" -c:v libx264 -pix_fmt yuv420p -movflags +faststart -r 30 "${outputVideoPath}"`;
+
+  console.log('🎬 تنفيذ أمر ffmpeg:', cmd);
+
+  try {
+    const { stdout, stderr } = await exec(cmd);
+    if (stderr) console.log('⚠️ stderr من ffmpeg:', stderr);
+    console.log('✅ تم إنشاء الفيديو بنجاح:', outputVideoPath);
+    return outputVideoPath;
+  } catch (error) {
+    console.error('❌ فشل تنفيذ ffmpeg:', error.message);
+    throw new Error(`ffmpeg فشل: ${error.message}`);
+  }
 }
 
-// ── معالج أمر /story مع قفل ──────────────────────────
+// ── معالج أمر /story مع قفل وتعليق نصي ──────────────
 async function handleStoryCommand(ctx, storyIdea) {
   const userId = ctx.from.id;
   if (storyLocks.get(userId)) {
@@ -343,6 +386,18 @@ async function handleStoryCommand(ctx, storyIdea) {
       }
     }
 
+    // ── إرسال التعليق النصي للقصة ──────────────────
+    let comment = '💫 انتهت القصة، وتبقى الذكريات.';
+    try {
+      // نفضل استخدام Gemini إن وجد
+      const client = gemini1 || gemini2 || null;
+      comment = await generateStoryComment(storyIdea, client);
+    } catch (e) {
+      console.error('❌ فشل التعليق النصي، نرسل الافتراضي.');
+    }
+    await ctx.reply(`📝 **تعليق على القصة:**\n${comment}`, { parse_mode: 'Markdown' });
+
+    // تنظيف الصور المؤقتة
     for (const img of imagePaths) {
       await fs.unlink(img).catch(() => {});
     }
@@ -596,19 +651,15 @@ bot.on('text', async (ctx) => {
 const app = express();
 app.use(express.json());
 
-// نقطة الصحة
 app.get('/', (_, res) => res.send('Bot is alive'));
 
-// Webhook باستخدام الطريقة الصحيحة
 app.post('/webhook', (req, res) => {
-  // استخدام webhookCallback مع معالجة الأخطاء
   bot.webhookCallback('/webhook')(req, res).catch(err => {
     console.error('❌ خطأ في webhook:', err);
     res.status(500).send('Internal Server Error');
   });
 });
 
-// تعيين Webhook يدوياً
 app.get('/setwebhook', async (req, res) => {
   try {
     const webhookUrl = `${APP_URL}/webhook`;
@@ -619,7 +670,6 @@ app.get('/setwebhook', async (req, res) => {
   }
 });
 
-// اختبار اتصال Telegram
 app.get('/test-telegram', async (_, res) => {
   try {
     const response = await axios.get(`https://api.telegram.org/bot${BOT_TOKEN}/getMe`);
@@ -642,7 +692,6 @@ app.listen(PORT, async () => {
   } catch (e) {
     console.error('❌ فشل تعيين Webhook:', e.message);
     console.log('⚠️ سيتم استخدام polling كحل احتياطي...');
-    // بدء polling في حال فشل webhook
     bot.launch().then(() => {
       console.log('✅ Bot يعمل عبر polling.');
     }).catch(err => console.error('❌ فشل بدء polling:', err));
