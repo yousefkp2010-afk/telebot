@@ -6,7 +6,6 @@ const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const fs = require('fs').promises;
-const path = require('path');
 const { promisify } = require('util');
 const exec = promisify(require('child_process').exec);
 const ffmpeg = require('fluent-ffmpeg');
@@ -98,8 +97,10 @@ function recordStat(model, success, duration) {
 // ── تخزين آخر طلبات ──────────────────────────────────
 const lastImagePrompt = new Map();
 const lastStoryPrompt = new Map();
+// قفل لمنع تنفيذ أكثر من أمر /story للمستخدم نفسه
+const storyLocks = new Map();
 
-// ── دالة توليد رابط الصورة (مع محاولات إعادة) ──────
+// ── دالة توليد رابط الصورة ──────────────────────────
 async function generateImageUrl(prompt) {
   const encoded = encodeURIComponent(prompt);
   return `https://image.pollinations.ai/prompt/${encoded}?model=flux&width=1024&height=1024&nologo=true`;
@@ -124,8 +125,8 @@ async function generateStoryDescriptions(storyIdea, geminiClient, retryCount = 0
   const prompt = `
 You are an expert at generating detailed image descriptions for a story.
 Based on the following story idea, generate exactly 8 highly detailed descriptions in English.
-Each description must be very detailed (at least 30 words) covering: characters (facial features, clothes, expressions), environment (background, colors, lighting), camera angle, artistic style (e.g., cinematic, realistic, cartoon, oil painting), and any visual elements that enhance the scene.
-Output only a valid JSON array of 8 strings. Do not add any extra text outside the JSON.
+Each description must be very detailed (at least 30 words) covering: characters, environment, camera angle, artistic style.
+Output only a valid JSON array of 8 strings. Do not add any extra text.
 
 Story idea: "${storyIdea}"
 
@@ -158,91 +159,64 @@ Output format: ["description 1", "description 2", ..., "description 8"]
   }
 }
 
-// ── تحميل صورة واحدة مع إعادة محاولة ──────────────────
-async function downloadImageWithRetry(url, filePath, retries = 3, delay = 5000) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
+// ── تحميل صورة واحدة مع إعادة محاولة (تأخير عشوائي) ──
+async function downloadImageWithRetry(url, filePath, maxRetries = 3) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      console.log(`📥 محاولة تحميل الصورة (${attempt}/${retries}) من ${url.substring(0, 60)}...`);
       const response = await axios.get(url, {
         responseType: 'arraybuffer',
-        timeout: 45000, // 45 ثانية مهلة
+        timeout: 60000,
       });
-      if (response.status !== 200) throw new Error(`HTTP ${response.status}`);
-      await fs.writeFile(filePath, response.data);
-      console.log(`✅ تم حفظ الصورة في ${filePath}`);
-      return true;
+      if (response.status === 200) {
+        await fs.writeFile(filePath, response.data);
+        return true;
+      }
+      throw new Error(`HTTP ${response.status}`);
     } catch (error) {
       console.error(`❌ فشل تحميل الصورة (محاولة ${attempt}): ${error.message}`);
-      if (attempt < retries) {
-        const wait = delay * attempt; // تأخير متزايد
-        console.log(`⏳ انتظار ${wait/1000} ثانية قبل المحاولة التالية...`);
-        await new Promise(r => setTimeout(r, wait));
+      if (attempt < maxRetries) {
+        const delay = 5000 + Math.random() * 10000; // 5-15 ثانية عشوائية
+        console.log(`⏳ انتظار ${Math.round(delay/1000)} ثانية...`);
+        await new Promise(r => setTimeout(r, delay));
       }
     }
   }
   return false;
 }
 
-// ── توليد الصور من الأوصاف (مع إعادة محاولة وتأخير) ──
+// ── توليد الصور من الأوصاف (مع تأخير ذكي) ──────────
 async function generateImagesFromDescriptions(descriptions, ctx) {
   const imagePaths = [];
   const total = descriptions.length;
-  // نرسل رسالة بداية
-  await ctx.reply(`🖼️ سيتم توليد ${total} صور (قد يستغرق كل منها 10-30 ثانية).`);
+  await ctx.reply(`🖼️ سيتم توليد ${total} صور (قد تستغرق كل منها 10-30 ثانية).`);
 
   for (let i = 0; i < total; i++) {
-    // إرسال رسالة تحضير
     await ctx.reply(`🔄 جاري التحضير للصورة ${i+1}/${total}...`);
-
     const prompt = descriptions[i];
     const url = await generateImageUrl(prompt);
     const fileName = `temp_img_${Date.now()}_${i}.jpg`;
-    let success = false;
-
-    // محاولة التحميل مع إعادة المحاولة
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        // نرسل رسالة "جارٍ الإنشاء"
-        await ctx.reply(`🖼️ جارٍ إنشاء الصورة ${i+1}/${total} (محاولة ${attempt})...`);
-        const response = await axios.get(url, {
-          responseType: 'arraybuffer',
-          timeout: 60000, // 60 ثانية مهلة
-        });
-        if (response.status === 200) {
-          await fs.writeFile(fileName, response.data);
-          imagePaths.push(fileName);
-          success = true;
-          await ctx.reply(`✅ تم تحميل الصورة ${i+1}/${total}`);
-          break;
-        } else {
-          throw new Error(`HTTP ${response.status}`);
-        }
-      } catch (error) {
-        console.error(`❌ فشل تحميل الصورة ${i+1} (محاولة ${attempt}): ${error.message}`);
-        if (attempt < 3) {
-          const wait = 5000 * attempt; // 5, 10, 15 ثانية
-          await ctx.reply(`⏳ سيتم إعادة المحاولة بعد ${wait/1000} ثوانٍ...`);
-          await new Promise(r => setTimeout(r, wait));
-        } else {
-          await ctx.reply(`❌ فشل تحميل الصورة ${i+1} بعد 3 محاولات. سيتم تخطيها.`);
-        }
-      }
+    
+    const success = await downloadImageWithRetry(url, fileName);
+    if (success) {
+      imagePaths.push(fileName);
+      await ctx.reply(`✅ تم تحميل الصورة ${i+1}/${total}`);
+    } else {
+      await ctx.reply(`❌ فشل تحميل الصورة ${i+1}/${total} بعد 3 محاولات. سيتم تخطيها.`);
     }
 
-    // تأخير إضافي بين الصور الناجحة (حتى لو فشلت ننتظر)
+    // تأخير قبل الصورة التالية (حتى لو فشلت)
     if (i < total - 1) {
-      const delay = 10000; // 10 ثوانٍ بين كل طلب ناجح
-      await ctx.reply(`⏳ انتظار ${delay/1000} ثوانٍ قبل الصورة التالية...`);
+      const delay = 10000 + Math.random() * 5000; // 10-15 ثانية
+      await ctx.reply(`⏳ انتظار ${Math.round(delay/1000)} ثانية قبل الصورة التالية...`);
       await new Promise(r => setTimeout(r, delay));
     }
   }
-
   return imagePaths;
 }
 
-// ── إنشاء فيديو من الصور (مع تحسينات) ────────────────
+// ── إنشاء فيديو من الصور ──────────────────────────────
 async function createVideoFromImages(imagePaths, outputVideoPath, durationPerImage = 3.5, fadeDuration = 0.5) {
-  if (imagePaths.length === 0) throw new Error('لا توجد صور لإنشاء الفيديو.');
+  if (imagePaths.length < 2) throw new Error('يلزم على الأقل صورتان لتكوين فيديو.');
   try { await exec('ffmpeg -version'); } catch (e) { throw new Error('ffmpeg غير مثبت.'); }
 
   return new Promise((resolve, reject) => {
@@ -294,21 +268,28 @@ async function createVideoFromImages(imagePaths, outputVideoPath, durationPerIma
   });
 }
 
-// ── معالج أمر /story الرئيسي ──────────────────────────
+// ── معالج أمر /story مع قفل ──────────────────────────
 async function handleStoryCommand(ctx, storyIdea) {
   const userId = ctx.from.id;
-  const startTime = Date.now();
-  console.log(`📖 طلب قصة من ${userId}: "${storyIdea}"`);
-  lastStoryPrompt.set(userId, storyIdea);
-
-  await ctx.reply('📖 جاري معالجة فكرة القصة وتوليد 8 أوصاف مفصلة... (قد يستغرق هذا دقيقة)');
-
-  let geminiClient = gemini1 || gemini2;
-  if (!geminiClient) {
-    return ctx.reply('❌ لا يوجد مفتاح Gemini. يرجى إعداد GEMINI_API_KEY.');
+  // قفل للمستخدم لمنع التداخل
+  if (storyLocks.get(userId)) {
+    return ctx.reply('⏳ لديك طلب قيد المعالجة، انتظر حتى يكتمل.');
   }
+  storyLocks.set(userId, true);
 
   try {
+    const startTime = Date.now();
+    console.log(`📖 طلب قصة من ${userId}: "${storyIdea}"`);
+    lastStoryPrompt.set(userId, storyIdea);
+
+    await ctx.reply('📖 جاري معالجة فكرة القصة وتوليد 8 أوصاف مفصلة... (قد يستغرق هذا دقيقة)');
+
+    let geminiClient = gemini1 || gemini2;
+    if (!geminiClient) {
+      await ctx.reply('❌ لا يوجد مفتاح Gemini. يرجى إعداد GEMINI_API_KEY.');
+      return;
+    }
+
     // 1. توليد الأوصاف
     const descriptions = await generateStoryDescriptions(storyIdea, geminiClient);
     await ctx.reply('✅ تم توليد 8 أوصاف. جاري إنشاء الصور...');
@@ -316,7 +297,8 @@ async function handleStoryCommand(ctx, storyIdea) {
     // 2. توليد الصور
     const imagePaths = await generateImagesFromDescriptions(descriptions, ctx);
     if (imagePaths.length === 0) {
-      return ctx.reply('❌ فشل تحميل جميع الصور. حاول مرة أخرى لاحقاً.');
+      await ctx.reply('❌ فشل تحميل جميع الصور. حاول مرة أخرى لاحقاً.');
+      return;
     }
 
     // 3. محاولة إنشاء الفيديو
@@ -380,6 +362,8 @@ async function handleStoryCommand(ctx, storyIdea) {
   } catch (error) {
     console.error('❌ خطأ في /story:', error);
     await ctx.reply(`❌ حدث خطأ: ${error.message}`);
+  } finally {
+    storyLocks.delete(userId); // تحرير القفل
   }
 }
 
@@ -431,6 +415,10 @@ bot.action('regen_story', async (ctx) => {
   await ctx.answerCbQuery();
   const prompt = lastStoryPrompt.get(ctx.from.id);
   if (!prompt) return ctx.reply('⚠️ لا توجد قصة سابقة.');
+  // نتحقق من القفل قبل استدعاء الأمر
+  if (storyLocks.get(ctx.from.id)) {
+    return ctx.reply('⏳ لديك طلب قيد المعالجة، انتظر حتى يكتمل.');
+  }
   await handleStoryCommand(ctx, prompt);
 });
 
@@ -614,12 +602,16 @@ bot.on('text', async (ctx) => {
   }
 });
 
-// ── خادم Express ──────────────────────────────────────
+// ── خادم Express مع Webhook الرسمي ──────────────────
 const app = express();
 app.use(express.json());
 
 app.get('/', (_, res) => res.send('Bot is alive'));
-app.post('/webhook', (req, res) => bot.handleUpdate(req.body, res));
+
+// استخدام webhookCallback الرسمي من Telegraf
+app.use(bot.webhookCallback('/webhook'));
+
+// نقطة تعيين Webhook يدوياً (اختياري)
 app.get('/setwebhook', async (req, res) => {
   try {
     const webhookUrl = `${APP_URL}/webhook`;
@@ -629,6 +621,7 @@ app.get('/setwebhook', async (req, res) => {
     res.status(500).send(`❌ ${e.message}`);
   }
 });
+
 app.get('/test-telegram', async (_, res) => {
   try {
     const response = await axios.get(`https://api.telegram.org/bot${BOT_TOKEN}/getMe`);
