@@ -12,50 +12,45 @@ const exec = promisify(require('child_process').exec);
 const ffmpeg = require('fluent-ffmpeg');
 
 // ── إعدادات البيئة ────────────────────────────────────
-console.log('🚀 بدء تشغيل البوت (Polling mode)...');
+console.log('🚀 بدء تشغيل البوت...');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
 const PORT = process.env.PORT || 3000;
+const APP_URL = process.env.APP_URL || `https://${process.env.RENDER_EXTERNAL_HOSTNAME || 'localhost'}`;
 
 if (!BOT_TOKEN) {
-  console.error('❌ BOT_TOKEN غير موجود في المتغيرات البيئية!');
+  console.error('❌ BOT_TOKEN غير موجود!');
   process.exit(1);
 }
 console.log('✅ BOT_TOKEN موجود.');
 
 // ── عملاء الذكاء الاصطناعي ────────────────────────────
-console.log('📦 جاري تهيئة عملاء الذكاء الاصطناعي...');
-
+console.log('📦 جاري تهيئة العملاء...');
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 console.log('✅ Groq جاهز.');
 
-let gemini1 = null;
-let gemini2 = null;
+let gemini1 = null, gemini2 = null;
 if (process.env.GEMINI_API_KEY) {
   gemini1 = new OpenAI({
     apiKey: process.env.GEMINI_API_KEY,
     baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai',
   });
-  console.log('✅ Gemini (المفتاح 1) جاهز.');
+  console.log('✅ Gemini (مفتاح 1) جاهز.');
 }
 if (process.env.GEMINI_API_KEY2) {
   gemini2 = new OpenAI({
     apiKey: process.env.GEMINI_API_KEY2,
     baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai',
   });
-  console.log('✅ Gemini (المفتاح 2) جاهز.');
-}
-if (!gemini1 && !gemini2) {
-  console.warn('⚠️ لا يوجد مفتاح Gemini. ستتوقف ميزة /story.');
+  console.log('✅ Gemini (مفتاح 2) جاهز.');
 }
 
-// ── التحقق من وجود ffmpeg ─────────────────────────────
-console.log('🔍 جاري التحقق من وجود ffmpeg...');
+// ── التحقق من ffmpeg ──────────────────────────────────
 (async () => {
   try {
     await exec('ffmpeg -version');
-    console.log('✅ ffmpeg مثبت ومتاح في النظام.');
+    console.log('✅ ffmpeg مثبت.');
   } catch (e) {
     console.error('❌ ffmpeg غير موجود! سيتم تعطيل ميزة الفيديو.');
   }
@@ -81,12 +76,10 @@ function getSession(userId) {
 function addMessageToSession(userId, role, content) {
   const session = getSession(userId);
   session.messages.push({ role, content });
-  if (session.messages.length > MAX_HISTORY) {
-    session.messages.shift();
-  }
+  if (session.messages.length > MAX_HISTORY) session.messages.shift();
 }
 
-// ── الإحصائيات ──────────────────────────────────────────
+// ── الإحصائيات ────────────────────────────────────────
 const stats = {
   groq: { success: 0, fail: 0, totalTime: 0 },
   gemini: { success: 0, fail: 0, totalTime: 0 },
@@ -98,25 +91,21 @@ const stats = {
 
 function recordStat(model, success, duration) {
   const s = stats[model];
-  if (success) {
-    s.success++;
-    s.totalTime += duration;
-  } else {
-    s.fail++;
-  }
+  if (success) { s.success++; s.totalTime += duration; }
+  else s.fail++;
 }
 
 // ── تخزين آخر طلبات ──────────────────────────────────
 const lastImagePrompt = new Map();
 const lastStoryPrompt = new Map();
 
-// ── دالة توليد رابط الصورة ──────────────────────────
+// ── دالة توليد رابط الصورة (مع محاولات إعادة) ──────
 async function generateImageUrl(prompt) {
   const encoded = encodeURIComponent(prompt);
   return `https://image.pollinations.ai/prompt/${encoded}?model=flux&width=1024&height=1024&nologo=true`;
 }
 
-// ── استخراج النص من رابط ──────────────────────────────
+// ── استخراج النص من رابط ─────────────────────────────
 async function extractTextFromUrl(url) {
   try {
     const { data } = await axios.get(url, { timeout: 8000 });
@@ -125,19 +114,13 @@ async function extractTextFromUrl(url) {
     const text = $('body').text().replace(/\s+/g, ' ').trim();
     return text.substring(0, 3000);
   } catch (e) {
-    console.error('فشل استخراج الرابط:', e.message);
+    console.error(`❌ فشل استخراج الرابط: ${e.message}`);
     return null;
   }
 }
 
-// ── دوال توليد القصة ──────────────────────────────────
-
-/**
- * توليد 8 أوصاف باللغة الإنجليزية بصيغة JSON باستخدام Gemini
- * مع إعادة محاولة تلقائية
- */
+// ── توليد أوصاف القصة (مع إعادة محاولة) ─────────────
 async function generateStoryDescriptions(storyIdea, geminiClient, retryCount = 0) {
-  console.log(`📝 توليد أوصاف القصة (محاولة ${retryCount + 1})...`);
   const prompt = `
 You are an expert at generating detailed image descriptions for a story.
 Based on the following story idea, generate exactly 8 highly detailed descriptions in English.
@@ -148,7 +131,6 @@ Story idea: "${storyIdea}"
 
 Output format: ["description 1", "description 2", ..., "description 8"]
 `;
-
   try {
     const completion = await geminiClient.chat.completions.create({
       model: 'gemini-2.5-flash',
@@ -161,17 +143,14 @@ Output format: ["description 1", "description 2", ..., "description 8"]
     });
     const content = completion.choices[0]?.message?.content || '';
     const jsonMatch = content.match(/\[[\s\S]*\]/);
-    if (!jsonMatch) throw new Error('لم يتم العثور على JSON في الرد.');
+    if (!jsonMatch) throw new Error('لم يتم العثور على JSON.');
     const descriptions = JSON.parse(jsonMatch[0]);
     if (!Array.isArray(descriptions) || descriptions.length < 8) {
-      throw new Error(`الرد يحتوي على ${descriptions.length} أوصاف فقط (مطلوب 8).`);
+      throw new Error(`عدد الأوصاف غير كافٍ (${descriptions.length})`);
     }
-    console.log(`✅ تم توليد ${descriptions.length} أوصاف بنجاح.`);
     return descriptions.slice(0, 8);
   } catch (error) {
-    console.error(`❌ فشل توليد الأوصاف (محاولة ${retryCount + 1}):`, error.message);
     if (retryCount < 2) {
-      console.log('🔄 إعادة المحاولة بعد 3 ثوانٍ...');
       await new Promise(r => setTimeout(r, 3000));
       return generateStoryDescriptions(storyIdea, geminiClient, retryCount + 1);
     }
@@ -179,218 +158,114 @@ Output format: ["description 1", "description 2", ..., "description 8"]
   }
 }
 
-/**
- * دالة مساعدة لإرسال رسالة عد تنازلي محدثة
- * ترسل رسالة جديدة وتقوم بتحديثها كل 5 ثوانٍ حتى تصل إلى 0
- */
-async function sendCountdown(ctx, imageNumber, total, initialSeconds = 30) {
-  let seconds = initialSeconds;
-  let message = await ctx.reply(
-    `⏳ سيتم إنشاء الصورة ${imageNumber}/${total} خلال ${seconds} ثانية...`
-  );
-
-  const interval = setInterval(async () => {
-    seconds -= 5;
-    if (seconds <= 0) {
-      clearInterval(interval);
-      try {
-        await ctx.telegram.editMessageText(
-          ctx.chat.id,
-          message.message_id,
-          undefined,
-          `🖼️ جارٍ إنشاء الصورة ${imageNumber}/${total} الآن...`
-        );
-      } catch (e) {}
-      return;
-    }
+// ── تحميل صورة واحدة مع إعادة محاولة ──────────────────
+async function downloadImageWithRetry(url, filePath, retries = 3, delay = 5000) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      await ctx.telegram.editMessageText(
-        ctx.chat.id,
-        message.message_id,
-        undefined,
-        `⏳ سيتم إنشاء الصورة ${imageNumber}/${total} خلال ${seconds} ثانية...`
-      );
-    } catch (e) {}
-  }, 5000);
-
-  // ننتظر حتى انتهاء العد التنازلي
-  await new Promise(resolve => {
-    const checkDone = setInterval(() => {
-      if (seconds <= 0) {
-        clearInterval(checkDone);
-        resolve();
-      }
-    }, 1000);
-  });
-
-  return message;
-}
-
-/**
- * توليد صورة واحدة مع إعادة محاولة عند 429 أو أي خطأ
- * مع مهلة قصوى 30 ثانية لكل طلب
- */
-async function generateSingleImageWithRetry(prompt, index, ctx, total, maxRetries = 3) {
-  const url = await generateImageUrl(prompt);
-  let lastError = null;
-  
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      console.log(`🖼️ محاولة ${attempt} للصورة ${index+1}...`);
-      
-      // إرسال عد تنازلي قبل كل محاولة (باستثناء المحاولة الأولى التي سبق أن أرسلنا لها عداً)
-      if (attempt > 1) {
-        await ctx.reply(`🔄 إعادة محاولة الصورة ${index+1} (محاولة ${attempt})...`);
-      }
-
-      // تأخير عشوائي بين 8-15 ثانية (يتم عرضه عبر العد التنازلي)
-      const delay = 8000 + Math.random() * 7000;
-      console.log(`⏳ انتظار ${Math.round(delay/1000)} ثوانٍ قبل الطلب...`);
-      
-      // نستخدم العد التنازلي لإعلام المستخدم
-      await sendCountdown(ctx, index+1, total, Math.ceil(delay / 1000));
-
-      console.log(`📡 إرسال طلب إلى Pollinations للصورة ${index+1}...`);
-      
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => {
-        console.warn(`⏰ انتهت مهلة 30 ثانية للصورة ${index+1}. إلغاء الطلب...`);
-        controller.abort();
-      }, 30000);
-
-      const response = await fetch(url, { 
-        signal: controller.signal,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
+      console.log(`📥 محاولة تحميل الصورة (${attempt}/${retries}) من ${url.substring(0, 60)}...`);
+      const response = await axios.get(url, {
+        responseType: 'arraybuffer',
+        timeout: 45000, // 45 ثانية مهلة
       });
-      clearTimeout(timeoutId);
-
-      if (response.status === 429) {
-        console.warn(`⚠️ 429 (معدل الطلبات) للصورة ${index+1}. انتظار 20 ثانية...`);
-        await ctx.reply(`⚠️ تجاوزت حد الطلبات، انتظر 20 ثانية قبل المحاولة مرة أخرى...`);
-        await new Promise(r => setTimeout(r, 20000));
-        continue;
-      }
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status} ${response.statusText}`);
-      }
-
-      const buffer = await response.arrayBuffer();
-      const fileName = `temp_img_${Date.now()}_${index}.jpg`;
-      await fs.writeFile(fileName, Buffer.from(buffer));
-      console.log(`✅ تم حفظ الصورة ${index+1} في ${fileName}`);
-      return fileName;
-      
-    } catch (err) {
-      if (err.name === 'AbortError') {
-        console.warn(`⏰ تم إلغاء طلب الصورة ${index+1} بسبب انتهاء المهلة.`);
-        lastError = new Error('انتهت مهلة الطلب');
-        await ctx.reply(`⏰ انتهت مهلة الطلب للصورة ${index+1}. جاري إعادة المحاولة...`);
-      } else {
-        lastError = err;
-        console.error(`❌ فشل توليد الصورة ${index+1} (محاولة ${attempt}):`, err.message);
-        await ctx.reply(`❌ فشلت محاولة ${attempt} للصورة ${index+1}: ${err.message}`);
-      }
-      
-      if (attempt < maxRetries) {
-        const wait = 15000 * attempt;
-        console.log(`⏳ انتظار ${wait/1000} ثوانٍ قبل المحاولة التالية...`);
-        await ctx.reply(`⏳ انتظار ${wait/1000} ثوانٍ قبل المحاولة التالية...`);
+      if (response.status !== 200) throw new Error(`HTTP ${response.status}`);
+      await fs.writeFile(filePath, response.data);
+      console.log(`✅ تم حفظ الصورة في ${filePath}`);
+      return true;
+    } catch (error) {
+      console.error(`❌ فشل تحميل الصورة (محاولة ${attempt}): ${error.message}`);
+      if (attempt < retries) {
+        const wait = delay * attempt; // تأخير متزايد
+        console.log(`⏳ انتظار ${wait/1000} ثانية قبل المحاولة التالية...`);
         await new Promise(r => setTimeout(r, wait));
       }
     }
   }
-  
-  throw new Error(`فشل توليد الصورة ${index+1} بعد ${maxRetries} محاولات: ${lastError?.message || 'غير معروف'}`);
+  return false;
 }
 
-/**
- * توليد جميع الصور وإرسالها فوراً للمستخدم
- * مع استمرار العملية حتى لو فشلت بعض الصور
- */
-async function generateAndSendImages(descriptions, ctx) {
+// ── توليد الصور من الأوصاف (مع إعادة محاولة وتأخير) ──
+async function generateImagesFromDescriptions(descriptions, ctx) {
   const imagePaths = [];
   const total = descriptions.length;
-  const failedImages = [];
-  
-  await ctx.reply(`🖼️ سيتم توليد ${total} صور وإرسالها فوراً (سيظهر عد تنازلي قبل كل صورة)...`);
+  // نرسل رسالة بداية
+  await ctx.reply(`🖼️ سيتم توليد ${total} صور (قد يستغرق كل منها 10-30 ثانية).`);
 
-  for (let i = 0; i < descriptions.length; i++) {
-    try {
-      // إعلام المستخدم ببدء التحضير للصورة
-      await ctx.reply(`🔄 جاري التحضير للصورة ${i+1}/${total}...`);
-      
-      const fileName = await generateSingleImageWithRetry(descriptions[i], i, ctx, total, 3);
-      
-      if (fileName) {
-        imagePaths.push(fileName);
-        // إرسال الصورة
-        await ctx.replyWithPhoto(
-          { source: fileName },
-          { caption: `📸 الصورة ${i+1}/${total}` }
-        );
-        console.log(`✅ تم إرسال الصورة ${i+1} للمستخدم.`);
-        stats.images++;
+  for (let i = 0; i < total; i++) {
+    // إرسال رسالة تحضير
+    await ctx.reply(`🔄 جاري التحضير للصورة ${i+1}/${total}...`);
+
+    const prompt = descriptions[i];
+    const url = await generateImageUrl(prompt);
+    const fileName = `temp_img_${Date.now()}_${i}.jpg`;
+    let success = false;
+
+    // محاولة التحميل مع إعادة المحاولة
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        // نرسل رسالة "جارٍ الإنشاء"
+        await ctx.reply(`🖼️ جارٍ إنشاء الصورة ${i+1}/${total} (محاولة ${attempt})...`);
+        const response = await axios.get(url, {
+          responseType: 'arraybuffer',
+          timeout: 60000, // 60 ثانية مهلة
+        });
+        if (response.status === 200) {
+          await fs.writeFile(fileName, response.data);
+          imagePaths.push(fileName);
+          success = true;
+          await ctx.reply(`✅ تم تحميل الصورة ${i+1}/${total}`);
+          break;
+        } else {
+          throw new Error(`HTTP ${response.status}`);
+        }
+      } catch (error) {
+        console.error(`❌ فشل تحميل الصورة ${i+1} (محاولة ${attempt}): ${error.message}`);
+        if (attempt < 3) {
+          const wait = 5000 * attempt; // 5, 10, 15 ثانية
+          await ctx.reply(`⏳ سيتم إعادة المحاولة بعد ${wait/1000} ثوانٍ...`);
+          await new Promise(r => setTimeout(r, wait));
+        } else {
+          await ctx.reply(`❌ فشل تحميل الصورة ${i+1} بعد 3 محاولات. سيتم تخطيها.`);
+        }
       }
-    } catch (err) {
-      console.error(`❌ فشل نهائي للصورة ${i+1}:`, err.message);
-      failedImages.push(i + 1);
-      await ctx.reply(`⚠️ فشلت الصورة ${i+1} بعد عدة محاولات: ${err.message}`);
-      console.log(`🔄 متابعة مع الصورة التالية...`);
+    }
+
+    // تأخير إضافي بين الصور الناجحة (حتى لو فشلت ننتظر)
+    if (i < total - 1) {
+      const delay = 10000; // 10 ثوانٍ بين كل طلب ناجح
+      await ctx.reply(`⏳ انتظار ${delay/1000} ثوانٍ قبل الصورة التالية...`);
+      await new Promise(r => setTimeout(r, delay));
     }
   }
-  
-  console.log(`📊 ملخص: تم توليد وإرسال ${imagePaths.length} من ${total} صور.`);
-  if (failedImages.length > 0) {
-    console.log(`❌ الصور الفاشلة: ${failedImages.join(', ')}`);
-    await ctx.reply(`⚠️ فشلت ${failedImages.length} صور: ${failedImages.join(', ')}`);
-  }
-  
+
   return imagePaths;
 }
 
-/**
- * إنشاء فيديو من الصور باستخدام ffmpeg (مع انتقال fade)
- */
+// ── إنشاء فيديو من الصور (مع تحسينات) ────────────────
 async function createVideoFromImages(imagePaths, outputVideoPath, durationPerImage = 3.5, fadeDuration = 0.5) {
-  console.log(`🎬 بدء إنشاء فيديو من ${imagePaths.length} صور...`);
-  
-  if (imagePaths.length === 0) {
-    throw new Error('لا توجد صور لإنشاء الفيديو.');
-  }
-
-  try {
-    await exec('ffmpeg -version');
-  } catch (e) {
-    throw new Error('ffmpeg غير مثبت على النظام. لا يمكن إنشاء الفيديو.');
-  }
+  if (imagePaths.length === 0) throw new Error('لا توجد صور لإنشاء الفيديو.');
+  try { await exec('ffmpeg -version'); } catch (e) { throw new Error('ffmpeg غير مثبت.'); }
 
   return new Promise((resolve, reject) => {
     const numImages = imagePaths.length;
     const duration = durationPerImage;
     const fade = fadeDuration;
-
     let command = ffmpeg();
     imagePaths.forEach(img => command.input(img));
 
     let filterParts = [];
+    let inputs = [];
     for (let i = 0; i < numImages; i++) {
       const inLabel = `[${i}:v]`;
       const outLabel = `[v${i}]`;
       const scaleFilter = `scale=1024:1024:force_original_aspect_ratio=decrease,pad=1024:1024:(ow-iw)/2:(oh-ih)/2`;
       const trimFilter = `trim=0:${duration},setpts=PTS-STARTPTS`;
       let fadeFilter = '';
-      if (i === 0) {
-        fadeFilter = `fade=in:0:d=${fade}`;
-      } else if (i === numImages - 1) {
-        fadeFilter = `fade=out:${duration - fade}:d=${fade}`;
-      } else {
-        fadeFilter = `fade=in:0:d=${fade},fade=out:${duration - fade}:d=${fade}`;
-      }
+      if (i === 0) fadeFilter = `fade=in:0:d=${fade}`;
+      else if (i === numImages - 1) fadeFilter = `fade=out:${duration - fade}:d=${fade}`;
+      else fadeFilter = `fade=in:0:d=${fade},fade=out:${duration - fade}:d=${fade}`;
       const filter = `${scaleFilter},${trimFilter},${fadeFilter}`;
       filterParts.push(`${inLabel} ${filter} ${outLabel}`);
+      inputs.push(outLabel);
     }
 
     let currentOutput = 'v0';
@@ -406,95 +281,64 @@ async function createVideoFromImages(imagePaths, outputVideoPath, durationPerIma
 
     const filterComplex = filterParts.join('; ');
     command = command.complexFilter(filterComplex, 'output');
-
     command
       .output(outputVideoPath)
       .videoCodec('libx264')
       .audioCodec('aac')
-      .outputOptions([
-        '-pix_fmt yuv420p',
-        '-movflags +faststart',
-        '-r 30'
-      ])
-      .on('start', (cmd) => console.log(`🎬 بدء ffmpeg: ${cmd}`))
-      .on('progress', (progress) => {
-        if (progress.percent) console.log(`⏳ تقدم الفيديو: ${Math.round(progress.percent)}%`);
-      })
-      .on('end', () => {
-        console.log(`✅ تم إنشاء الفيديو: ${outputVideoPath}`);
-        resolve(outputVideoPath);
-      })
-      .on('error', (err) => {
-        console.error('❌ خطأ في ffmpeg:', err);
-        reject(err);
-      })
+      .outputOptions(['-pix_fmt yuv420p', '-movflags +faststart', '-r 30'])
+      .on('start', (cmd) => console.log(`🎬 ffmpeg بدأ: ${cmd}`))
+      .on('progress', (p) => { if (p.percent) console.log(`⏳ تقدم الفيديو: ${Math.round(p.percent)}%`); })
+      .on('end', () => { console.log(`✅ فيديو تم إنشاؤه: ${outputVideoPath}`); resolve(outputVideoPath); })
+      .on('error', (err) => { console.error('❌ خطأ ffmpeg:', err.message); reject(err); })
       .run();
   });
 }
 
-/**
- * الدالة الرئيسية لمعالجة /story
- */
+// ── معالج أمر /story الرئيسي ──────────────────────────
 async function handleStoryCommand(ctx, storyIdea) {
   const userId = ctx.from.id;
   const startTime = Date.now();
-  console.log(`📖 بدء معالجة قصة للمستخدم ${userId}: "${storyIdea}"`);
-
+  console.log(`📖 طلب قصة من ${userId}: "${storyIdea}"`);
   lastStoryPrompt.set(userId, storyIdea);
-  
+
   await ctx.reply('📖 جاري معالجة فكرة القصة وتوليد 8 أوصاف مفصلة... (قد يستغرق هذا دقيقة)');
 
   let geminiClient = gemini1 || gemini2;
   if (!geminiClient) {
-    return ctx.reply('❌ لا يوجد مفتاح Gemini لتوليد الأوصاف. يرجى إعداد GEMINI_API_KEY في البيئة.');
+    return ctx.reply('❌ لا يوجد مفتاح Gemini. يرجى إعداد GEMINI_API_KEY.');
   }
 
   try {
-    console.log('📝 المرحلة 1: توليد الأوصاف...');
+    // 1. توليد الأوصاف
     const descriptions = await generateStoryDescriptions(storyIdea, geminiClient);
-    console.log(`✅ تم توليد ${descriptions.length} وصفاً.`);
+    await ctx.reply('✅ تم توليد 8 أوصاف. جاري إنشاء الصور...');
 
-    await ctx.reply('✅ تم توليد 8 أوصاف. سيتم الآن توليد الصور وإرسالها واحدة تلو الأخرى...');
-
-    console.log('🖼️ المرحلة 2: توليد الصور وإرسالها...');
-    const imagePaths = await generateAndSendImages(descriptions, ctx);
-    
+    // 2. توليد الصور
+    const imagePaths = await generateImagesFromDescriptions(descriptions, ctx);
     if (imagePaths.length === 0) {
-      console.error('❌ لم يتم توليد أي صورة.');
-      return ctx.reply('❌ فشل توليد جميع الصور. حاول مرة أخرى.');
+      return ctx.reply('❌ فشل تحميل جميع الصور. حاول مرة أخرى لاحقاً.');
     }
 
-    console.log(`✅ تم إرسال ${imagePaths.length} صور للمستخدم.`);
-
-    if (imagePaths.length < 2) {
-      await ctx.reply('⚠️ عدد الصور أقل من 2، لا يمكن إنشاء فيديو.');
-      for (const img of imagePaths) {
-        await fs.unlink(img).catch(() => {});
-      }
-      return;
-    }
-
-    await ctx.reply(`🎬 جاري محاولة إنشاء فيديو من ${imagePaths.length} صور... (قد يستغرق 15-30 ثانية)`);
-
+    // 3. محاولة إنشاء الفيديو
     let videoCreated = false;
     let videoFileName = null;
-
     try {
       videoFileName = `story_video_${Date.now()}.mp4`;
-      await createVideoFromImages(imagePaths, videoFileName, 3.5, 0.5);
+      await ctx.reply(`🎬 جاري تجميع ${imagePaths.length} صورة في فيديو...`);
+      await createVideoFromImages(imagePaths, videoFileName);
       videoCreated = true;
-      console.log(`✅ تم إنشاء الفيديو: ${videoFileName}`);
     } catch (videoError) {
-      console.error(`❌ فشل إنشاء الفيديو:`, videoError.message);
-      await ctx.reply(`⚠️ تعذر إنشاء الفيديو: ${videoError.message}`);
+      console.error('❌ فشل الفيديو:', videoError.message);
+      await ctx.reply(`⚠️ تعذر إنشاء الفيديو (${videoError.message}). سيتم إرسال الصور منفردة.`);
     }
 
+    // 4. إرسال النتيجة
     if (videoCreated && videoFileName) {
       try {
         await ctx.replyWithVideo(
           { source: videoFileName },
           {
-            caption: `🎥 فيديو القصة المصور (كل صورة 3.5 ثانية)\n\n📖 الفكرة: ${storyIdea}`,
+            caption: `🎥 فيديو القصة\n📖 الفكرة: ${storyIdea}`,
             reply_markup: {
               inline_keyboard: [
                 [{ text: '🔄 إعادة توليد الفيديو', callback_data: 'regen_story' }]
@@ -502,57 +346,64 @@ async function handleStoryCommand(ctx, storyIdea) {
             }
           }
         );
-        console.log(`✅ تم إرسال الفيديو.`);
         stats.stories++;
         await fs.unlink(videoFileName).catch(() => {});
       } catch (sendError) {
-        console.error(`❌ فشل إرسال الفيديو:`, sendError.message);
-        await ctx.reply('⚠️ تعذر إرسال الفيديو، لكن تم إرسال الصور بالفعل.');
+        console.error('❌ فشل إرسال الفيديو:', sendError.message);
+        videoCreated = false;
       }
     }
 
-    console.log(`🧹 تنظيف ${imagePaths.length} صورة مؤقتة...`);
+    // إذا فشل الفيديو، نرسل الصور منفردة
+    if (!videoCreated) {
+      for (let i = 0; i < imagePaths.length; i++) {
+        try {
+          await ctx.replyWithPhoto(
+            { source: imagePaths[i] },
+            { caption: `📸 الصورة ${i+1}/${imagePaths.length}` }
+          );
+        } catch (photoError) {
+          console.error(`❌ فشل إرسال الصورة ${i+1}:`, photoError.message);
+        }
+        await new Promise(r => setTimeout(r, 500));
+      }
+    }
+
+    // تنظيف الصور المؤقتة
     for (const img of imagePaths) {
-      await fs.unlink(img).catch((err) => {
-        console.warn(`⚠️ تعذر حذف ${img}:`, err.message);
-      });
+      await fs.unlink(img).catch(() => {});
     }
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    console.log(`✅ اكتملت معالجة القصة في ${elapsed} ثانية.`);
-    await ctx.reply(`✨ تم! (استغرق المعالجة ${elapsed} ثانية)`);
+    await ctx.reply(`✨ تم! (استغرق ${elapsed} ثانية)`);
 
   } catch (error) {
-    console.error(`❌ خطأ عام في /story:`, error);
-    await ctx.reply(`❌ حدث خطأ أثناء توليد الفيديو: ${error.message}`);
+    console.error('❌ خطأ في /story:', error);
+    await ctx.reply(`❌ حدث خطأ: ${error.message}`);
   }
 }
 
-// ── إنشاء البوت ──────────────────────────────────────
+// ── إنشاء البوت ────────────────────────────────────────
 const bot = new Telegraf(BOT_TOKEN);
 
-// ── معالج الأزرار التفاعلية ──────────────────────────
+// ── أزرار تفاعلية ──────────────────────────────────────
 bot.action(/^cmd_(.+)$/, async (ctx) => {
   const action = ctx.match[1];
   await ctx.answerCbQuery();
-  if (action === 'gemini') {
-    ctx.reply('🧠 اكتب سؤالك بعد **/gemini**\nمثال: `/gemini ما هو الذكاء الاصطناعي؟`', { parse_mode: 'Markdown' });
-  } else if (action === 'groq') {
-    ctx.reply('⚡ اكتب سؤالك بعد **/groq**\nمثال: `/groq اشرح النظرية النسبية`', { parse_mode: 'Markdown' });
-  } else if (action === 'image') {
-    ctx.reply('🖼️ اكتب وصف الصورة بعد **/image**\nمثال: `/image منظر طبيعي لجبال`', { parse_mode: 'Markdown' });
-  } else if (action === 'story') {
-    ctx.reply('📖 اكتب فكرة القصة بعد **/story**\nمثال: `/story طفل يكتشف غابة مسحورة`', { parse_mode: 'Markdown' });
-  } else if (action === 'help') {
-    ctx.reply('📘 استخدم **/help** لعرض جميع الأوامر.', { parse_mode: 'Markdown' });
-  }
+  const replies = {
+    gemini: '🧠 اكتب سؤالك بعد **/gemini**',
+    groq: '⚡ اكتب سؤالك بعد **/groq**',
+    image: '🖼️ اكتب وصف الصورة بعد **/image**',
+    story: '📖 اكتب فكرة القصة بعد **/story**',
+    help: '📘 استخدم **/help** لعرض جميع الأوامر.'
+  };
+  ctx.reply(replies[action] || '❓ أمر غير معروف.', { parse_mode: 'Markdown' });
 });
 
 bot.action('regen_image', async (ctx) => {
   await ctx.answerCbQuery();
-  const userId = ctx.from.id;
-  const prompt = lastImagePrompt.get(userId);
-  if (!prompt) return ctx.reply('⚠️ لا يوجد وصف سابق لإعادة التوليد.');
+  const prompt = lastImagePrompt.get(ctx.from.id);
+  if (!prompt) return ctx.reply('⚠️ لا يوجد وصف سابق.');
   await ctx.sendChatAction('upload_photo');
   const statusMsg = await ctx.reply('🎨 جارٍ إعادة توليد الصورة...');
   try {
@@ -560,154 +411,126 @@ bot.action('regen_image', async (ctx) => {
     await ctx.replyWithPhoto(
       { url: imageUrl },
       {
-        caption: `🖼️ ${prompt}\n\nتم الانشاء بواسطة بوت @ysfaibot`,
+        caption: `🖼️ ${prompt}`,
         reply_markup: {
           inline_keyboard: [
             [{ text: '🔄 إعادة التوليد', callback_data: 'regen_image' }],
-            [{ text: '⬇️ تحميل الصورة', url: imageUrl }]
+            [{ text: '⬇️ تحميل', url: imageUrl }]
           ]
         }
       }
     );
     stats.images++;
     await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
-  } catch (error) {
-    console.error('خطأ في إعادة التوليد:', error.message);
-    await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, '❌ فشلت إعادة التوليد. حاول لاحقاً.').catch(() => {});
+  } catch (e) {
+    await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, '❌ فشل إعادة التوليد.');
   }
 });
 
 bot.action('regen_story', async (ctx) => {
   await ctx.answerCbQuery();
-  const userId = ctx.from.id;
-  const prompt = lastStoryPrompt.get(userId);
-  if (!prompt) return ctx.reply('⚠️ لا توجد قصة سابقة لإعادة التوليد.');
+  const prompt = lastStoryPrompt.get(ctx.from.id);
+  if (!prompt) return ctx.reply('⚠️ لا توجد قصة سابقة.');
   await handleStoryCommand(ctx, prompt);
 });
 
-// ── الأمر /start ────────────────────────────────────────
+// ── الأوامر ────────────────────────────────────────────
 bot.start((ctx) => {
-  const welcome = `🌟 **مرحباً بك في البوت الذكي!**\n\nاختر إحدى الخدمات:`;
-  ctx.reply(welcome, {
+  ctx.reply('🌟 **مرحباً بك في البوت الذكي!**\nاختر خدمة:', {
     parse_mode: 'Markdown',
     reply_markup: {
       inline_keyboard: [
-        [
-          { text: '🧠 اسأل Gemini', callback_data: 'cmd_gemini' },
-          { text: '⚡ اسأل Groq', callback_data: 'cmd_groq' }
-        ],
-        [
-          { text: '🖼️ توليد صورة', callback_data: 'cmd_image' },
-          { text: '📖 توليد فيديو من قصة', callback_data: 'cmd_story' }
-        ],
-        [
-          { text: 'ℹ️ مساعدة', callback_data: 'cmd_help' }
-        ]
+        [{ text: '🧠 Gemini', callback_data: 'cmd_gemini' }, { text: '⚡ Groq', callback_data: 'cmd_groq' }],
+        [{ text: '🖼️ صورة', callback_data: 'cmd_image' }, { text: '📖 قصة', callback_data: 'cmd_story' }],
+        [{ text: 'ℹ️ مساعدة', callback_data: 'cmd_help' }]
       ]
     }
   });
 });
 
-// ── الأمر /help ────────────────────────────────────────
 bot.help((ctx) => {
-  const help = `📘 **دليل الاستخدام**\n\n` +
-    `• **/gemini [نص]** – اسأل نموذج Google Gemini (عميق)\n` +
-    `• **/groq [نص]** – اسأل نموذج Groq (سريع)\n` +
-    `• **/image [وصف]** – توليد صورة بالذكاء الاصطناعي\n` +
-    `• **/story [فكرة]** – توليد فيديو من 8 صور متسلسلة بناءً على فكرة قصة\n` +
-    `• **/start** – رسالة الترحيب مع أزرار تفاعلية\n` +
-    `• **/help** – هذا الدليل\n` +
-    `• **/stats** – إحصائيات الاستخدام (للمالك فقط)\n\n` +
-    `🔄 **السياق:** تذكر آخر 3 تبادلات لمدة 10 دقائق.\n` +
-    `⚠️ **احتياطي:** عند فشل نموذج، ينتقل تلقائياً إلى الآخر.\n` +
-    `🖼️ **الصور:** مدعومة عبر Pollinations.ai (مجاني، جودة عالية).\n` +
-    `📄 **تلخيص الروابط:** أرسل رابطاً لتلخيص المقال فوراً.`;
-  ctx.reply(help, { parse_mode: 'Markdown' });
+  ctx.reply(
+    `📘 **دليل الاستخدام**\n\n` +
+    `• /gemini [نص] – اسأل Gemini\n` +
+    `• /groq [نص] – اسأل Groq\n` +
+    `• /image [وصف] – توليد صورة\n` +
+    `• /story [فكرة] – توليد فيديو من قصة\n` +
+    `• /start – الترحيب\n` +
+    `• /help – هذا الدليل\n` +
+    `• /stats – إحصائيات (للمالك)`,
+    { parse_mode: 'Markdown' }
+  );
 });
 
-// ── الأمر /stats ────────────────────────────────────────
 bot.command('stats', (ctx) => {
-  const userId = String(ctx.from.id);
-  if (ADMIN_CHAT_ID && userId !== ADMIN_CHAT_ID) {
-    return ctx.reply('⛔ هذا الأمر مخصص للمالك فقط.');
+  if (ADMIN_CHAT_ID && String(ctx.from.id) !== ADMIN_CHAT_ID) {
+    return ctx.reply('⛔ هذا الأمر للمالك فقط.');
   }
   const now = Date.now();
-  const uptimeMs = now - stats.lastReset;
-  const uptimeMins = Math.floor(uptimeMs / 60000);
+  const uptimeMins = Math.floor((now - stats.lastReset) / 60000);
   const groqAvg = stats.groq.success > 0 ? (stats.groq.totalTime / stats.groq.success).toFixed(0) : 0;
   const geminiAvg = stats.gemini.success > 0 ? (stats.gemini.totalTime / stats.gemini.success).toFixed(0) : 0;
-  const report = `📊 **إحصائيات البوت** (آخر ${uptimeMins} دقيقة)\n\n` +
-    `⚡ **Groq:** ${stats.groq.success} نجاح | ${stats.groq.fail} فشل | متوسط ${groqAvg}ms\n` +
-    `🧠 **Gemini:** ${stats.gemini.success} نجاح | ${stats.gemini.fail} فشل | متوسط ${geminiAvg}ms\n` +
-    `🖼️ **الصور المولدة:** ${stats.images}\n` +
-    `📄 **التلخيصات:** ${stats.summaries}\n` +
-    `🎬 **فيديوهات القصص:** ${stats.stories}\n` +
-    `🔄 **المستخدمين النشطين:** ${sessions.size}`;
-  ctx.reply(report, { parse_mode: 'Markdown' });
+  ctx.reply(
+    `📊 **إحصائيات** (آخر ${uptimeMins} دقيقة)\n` +
+    `⚡ Groq: ${stats.groq.success} نجاح | ${stats.groq.fail} فشل | متوسط ${groqAvg}ms\n` +
+    `🧠 Gemini: ${stats.gemini.success} نجاح | ${stats.gemini.fail} فشل | متوسط ${geminiAvg}ms\n` +
+    `🖼️ صور: ${stats.images}\n📄 تلخيص: ${stats.summaries}\n🎬 فيديوهات: ${stats.stories}\n👥 جلسات: ${sessions.size}`,
+    { parse_mode: 'Markdown' }
+  );
 });
 
-// ── استخراج النص بعد الأمر ────────────────────────────
+// ── معالج الرسائل ──────────────────────────────────────
 function extractQuestion(text, command) {
-  if (text.startsWith(command + ' ')) {
-    return text.slice(command.length + 1).trim();
-  }
-  if (text.startsWith(command)) {
-    return text.slice(command.length).trim();
-  }
+  if (text.startsWith(command + ' ')) return text.slice(command.length + 1).trim();
+  if (text.startsWith(command)) return text.slice(command.length).trim();
   return '';
 }
 
-// ── معالج الرسائل النصية ─────────────────────────────
 bot.on('text', async (ctx) => {
   const text = ctx.message.text.trim();
   const userId = ctx.from.id;
 
   // تلخيص الروابط
   if (!text.startsWith('/')) {
-    const urlRegex = /(https?:\/\/[^\s]+)/g;
-    const urls = text.match(urlRegex);
-    if (urls && urls.length > 0) {
+    const urls = text.match(/(https?:\/\/[^\s]+)/g);
+    if (urls && urls.length) {
       const url = urls[0];
       await ctx.sendChatAction('typing');
-      const statusMsg = await ctx.reply('📄 جارٍ استخراج النص من الرابط...');
+      const statusMsg = await ctx.reply('📄 جارٍ استخراج النص...');
       const articleText = await extractTextFromUrl(url);
       if (!articleText) {
-        await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, '❌ تعذر استخراج النص من الرابط. تأكد من أنه رابط مقال متاح للجميع.');
-        return;
+        return ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, '❌ تعذر استخراج النص.');
       }
       try {
         const completion = await groq.chat.completions.create({
           model: 'llama-3.3-70b-versatile',
           messages: [
-            { role: 'system', content: 'أنت ملخص محترف. لخص النص التالي في فقرة أو فقرات قصيرة مع أبرز النقاط، باللغة العربية. استخدم Markdown وإيموجيز خفيفة.' },
-            { role: 'user', content: `لخص هذا النص:\n\n${articleText}` }
+            { role: 'system', content: 'لخص النص التالي بالعربية، مع أبرز النقاط، استخدم Markdown.' },
+            { role: 'user', content: `لخص:\n${articleText}` }
           ],
           stream: false,
         });
-        const summary = completion.choices[0]?.message?.content || 'لم أستطع تلخيص النص.';
+        const summary = completion.choices[0]?.message?.content || '';
         await ctx.telegram.editMessageText(
           ctx.chat.id,
           statusMsg.message_id,
           undefined,
-          `📝 **تلخيص المقال**\n${summary}`,
+          `📝 **التلخيص**\n${summary}`,
           { parse_mode: 'Markdown' }
         );
         stats.summaries++;
       } catch (e) {
-        console.error('خطأ تلخيص:', e.message);
-        await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, '❌ فشل التلخيص. حاول لاحقاً.');
+        await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, '❌ فشل التلخيص.');
       }
       return;
     }
     return;
   }
 
-  // /image
+  // أمر /image
   if (text.startsWith('/image')) {
     const prompt = extractQuestion(text, '/image');
-    if (!prompt) {
-      return ctx.reply('🖼️ اكتب وصف الصورة بعد /image\nمثال: /image قطة بيضاء تجلس على كرسي');
-    }
+    if (!prompt) return ctx.reply('🖼️ اكتب وصفاً بعد /image');
     lastImagePrompt.set(userId, prompt);
     await ctx.sendChatAction('upload_photo');
     const statusMsg = await ctx.reply('🎨 جارٍ توليد الصورة...');
@@ -716,159 +539,132 @@ bot.on('text', async (ctx) => {
       await ctx.replyWithPhoto(
         { url: imageUrl },
         {
-          caption: `🖼️ ${prompt}\n\nتم الانشاء بواسطة بوت @ysfaibot`,
+          caption: `🖼️ ${prompt}`,
           reply_markup: {
             inline_keyboard: [
               [{ text: '🔄 إعادة التوليد', callback_data: 'regen_image' }],
-              [{ text: '⬇️ تحميل الصورة', url: imageUrl }]
+              [{ text: '⬇️ تحميل', url: imageUrl }]
             ]
           }
         }
       );
       stats.images++;
       await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
-    } catch (error) {
-      console.error('خطأ في توليد الصورة:', error.message);
-      await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, '❌ فشل توليد الصورة. حاول لاحقاً.').catch(() => {});
+    } catch (e) {
+      await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, undefined, '❌ فشل توليد الصورة.');
     }
     return;
   }
 
-  // /story
+  // أمر /story
   if (text.startsWith('/story')) {
     const storyIdea = extractQuestion(text, '/story');
-    if (!storyIdea) {
-      return ctx.reply('📖 اكتب فكرة القصة بعد /story\nمثال: /story طفل يكتشف غابة مسحورة');
-    }
+    if (!storyIdea) return ctx.reply('📖 اكتب فكرة القصة بعد /story');
     await handleStoryCommand(ctx, storyIdea);
     return;
   }
 
-  // /gemini و /groq
+  // أوامر /gemini و /groq
   if (!text.startsWith('/gemini') && !text.startsWith('/groq')) return;
-
   const isGemini = text.startsWith('/gemini');
   const command = isGemini ? '/gemini' : '/groq';
   const question = extractQuestion(text, command);
-
-  if (!question) {
-    return ctx.reply(`❓ اكتب سؤالك بعد ${command}\nمثال: ${command} ما هو الذكاء الاصطناعي؟`);
-  }
+  if (!question) return ctx.reply(`❓ اكتب سؤالك بعد ${command}`);
 
   const session = getSession(userId);
-  const systemMessage = { role: 'system', content: 'أنت مساعد خبير، أجب بإجابات واضحة ومنسقة باستخدام Markdown مع إيموجيز خفيفة.' };
+  const systemMessage = { role: 'system', content: 'أنت مساعد خبير، أجب بإجابات واضحة ومنسقة باستخدام Markdown.' };
   const messages = [systemMessage, ...session.messages, { role: 'user', content: question }];
 
   const executeRequest = async (modelType, client, modelName) => {
     const start = Date.now();
     try {
       await ctx.sendChatAction('typing');
-      const completion = await client.chat.completions.create({
-        model: modelName,
-        messages,
-        stream: false,
-      });
-      const reply = completion.choices[0]?.message?.content || 'لم أحصل على رد.';
+      const completion = await client.chat.completions.create({ model: modelName, messages, stream: false });
+      const reply = completion.choices[0]?.message?.content || 'لا رد.';
       addMessageToSession(userId, 'user', question);
       addMessageToSession(userId, 'assistant', reply);
-      const duration = Date.now() - start;
-      recordStat(modelType, true, duration);
+      recordStat(modelType, true, Date.now() - start);
       await ctx.reply(reply, { parse_mode: 'Markdown' });
       return true;
-    } catch (error) {
-      const duration = Date.now() - start;
-      recordStat(modelType, false, duration);
-      console.error(`خطأ ${modelType}:`, error.message);
+    } catch (e) {
+      recordStat(modelType, false, Date.now() - start);
+      console.error(`❌ خطأ ${modelType}:`, e.message);
       return false;
     }
   };
 
   if (isGemini) {
     let success = false;
-    if (gemini1) {
-      success = await executeRequest('gemini', gemini1, 'gemini-2.5-flash');
-    }
-    if (!success && gemini2) {
-      success = await executeRequest('gemini', gemini2, 'gemini-2.5-flash');
-    }
+    if (gemini1) success = await executeRequest('gemini', gemini1, 'gemini-2.5-flash');
+    if (!success && gemini2) success = await executeRequest('gemini', gemini2, 'gemini-2.5-flash');
     if (!success) {
-      const message = gemini1 || gemini2
-        ? '⚠️ تعذر الاتصال بـ Gemini. جاري تحويل طلبك إلى Groq...'
-        : '⚠️ نموذج Gemini غير مفعل. جاري استخدام Groq بدلاً منه...';
-      ctx.reply(message);
+      await ctx.reply('⚠️ جاري التحويل إلى Groq...');
       const groqSuccess = await executeRequest('groq', groq, 'llama-3.3-70b-versatile');
-      if (!groqSuccess) ctx.reply('❌ فشل كلا النموذجين. حاول لاحقاً.');
+      if (!groqSuccess) ctx.reply('❌ فشل كلا النموذجين.');
     }
   } else {
-    const success = await executeRequest('groq', groq, 'llama-3.3-70b-versatile');
-    if (!success) {
-      if (gemini1 || gemini2) {
-        ctx.reply('⚠️ تعذر الاتصال بـ Groq. جاري تحويل طلبك إلى Gemini...');
-        let geminiSuccess = false;
-        if (gemini1) {
-          geminiSuccess = await executeRequest('gemini', gemini1, 'gemini-2.5-flash');
-        }
-        if (!geminiSuccess && gemini2) {
-          geminiSuccess = await executeRequest('gemini', gemini2, 'gemini-2.5-flash');
-        }
-        if (!geminiSuccess) ctx.reply('❌ فشل كلا النموذجين. حاول لاحقاً.');
-      } else {
-        ctx.reply('❌ فشل نموذج Groq ولا يوجد نموذج بديل.');
-      }
+    let success = await executeRequest('groq', groq, 'llama-3.3-70b-versatile');
+    if (!success && (gemini1 || gemini2)) {
+      await ctx.reply('⚠️ جاري التحويل إلى Gemini...');
+      let geminiSuccess = false;
+      if (gemini1) geminiSuccess = await executeRequest('gemini', gemini1, 'gemini-2.5-flash');
+      if (!geminiSuccess && gemini2) geminiSuccess = await executeRequest('gemini', gemini2, 'gemini-2.5-flash');
+      if (!geminiSuccess) ctx.reply('❌ فشل كلا النموذجين.');
     }
   }
 });
 
-// ── خادم Express (فقط للـ Health Check و Guard) ──────
+// ── خادم Express ──────────────────────────────────────
 const app = express();
 app.use(express.json());
 
-app.get('/', (_, res) => res.send('Bot is alive (Polling mode)'));
-
-// ── تشغيل البوت باستخدام Polling ─────────────────────
-(async () => {
+app.get('/', (_, res) => res.send('Bot is alive'));
+app.post('/webhook', (req, res) => bot.handleUpdate(req.body, res));
+app.get('/setwebhook', async (req, res) => {
   try {
-    await bot.telegram.deleteWebhook();
-    console.log('✅ تم إلغاء Webhook (إن وجد).');
+    const webhookUrl = `${APP_URL}/webhook`;
+    const result = await bot.telegram.setWebhook(webhookUrl);
+    res.send(`✅ Webhook set to ${webhookUrl}\n${JSON.stringify(result)}`);
   } catch (e) {
-    console.warn('⚠️ فشل إلغاء Webhook:', e.message);
+    res.status(500).send(`❌ ${e.message}`);
   }
-
-  bot.launch()
-    .then(() => {
-      console.log('✅ البوت يعمل الآن باستخدام Polling (getUpdates).');
-      console.log('🤖 جاهز لاستقبال الأوامر.');
-    })
-    .catch((err) => {
-      console.error('❌ فشل تشغيل البوت:', err);
-      process.exit(1);
-    });
-})();
-
-app.listen(PORT, () => {
-  console.log(`🚀 Express يعمل على المنفذ ${PORT} (للـ Health Check فقط)`);
+});
+app.get('/test-telegram', async (_, res) => {
+  try {
+    const response = await axios.get(`https://api.telegram.org/bot${BOT_TOKEN}/getMe`);
+    res.send(`✅ ${JSON.stringify(response.data)}`);
+  } catch (e) {
+    res.status(500).send(`❌ ${e.message}`);
+  }
 });
 
-// ── الحارس المتبادل ────────────────────────────────────
-const GUARD_URL = process.env.GUARD_URL;
-if (GUARD_URL) {
-  const ping = () => {
-    fetch(GUARD_URL)
-      .then(res => console.log(`🏓 Ping guard: ${res.status}`))
-      .catch(err => console.error('❌ Guard unreachable:', err.message));
-  };
-  setInterval(ping, 30000);
-  ping();
+// ── تشغيل الخادم ──────────────────────────────────────
+app.listen(PORT, async () => {
+  console.log(`🚀 Express يعمل على المنفذ ${PORT}`);
+  try {
+    const webhookUrl = `${APP_URL}/webhook`;
+    await bot.telegram.setWebhook(webhookUrl);
+    console.log(`✅ Webhook تم تعيينه إلى ${webhookUrl}`);
+  } catch (e) {
+    console.error('❌ فشل تعيين Webhook:', e.message);
+  }
+});
+
+// ── الحارس المتبادل ──────────────────────────────────
+if (process.env.GUARD_URL) {
+  setInterval(() => {
+    axios.get(process.env.GUARD_URL).catch(() => {});
+  }, 30000);
 }
 
-process.once('SIGINT', () => {
-  console.log('🛑 إيقاف البوت...');
-  bot.stop('SIGINT');
+// ── إيقاف نظيف ──────────────────────────────────────
+process.once('SIGINT', async () => {
+  await bot.telegram.deleteWebhook().catch(() => {});
+  process.exit(0);
+});
+process.once('SIGTERM', async () => {
+  await bot.telegram.deleteWebhook().catch(() => {});
   process.exit(0);
 });
 
-process.once('SIGTERM', () => {
-  console.log('🛑 إيقاف البوت...');
-  bot.stop('SIGTERM');
-  process.exit(0);
-});
+console.log('✅ البوت جاهز.');
